@@ -173,30 +173,30 @@ async function runSync() {
     totalResponses = data.total || totalResponses;
 
     for (const resp of responses) {
-      const answers = resp.answers || [];
-
-      // Construir mapa questionId → texto-resuelto
+      // SM bulk API devuelve resp.pages[].questions[].answers[]
+      // (NO un array answers plano en la raíz)
       const qMap = {};
-      for (const ans of answers) {
-        const qid = ans.question_id;
-        if (!qid) continue;
-        const qChoices = choiceMap[qid] || {};
-        const val = resolveAnswer(ans, qChoices);
-        if (val && !qMap[qid]) qMap[qid] = val;
+      for (const page of (resp.pages || [])) {
+        for (const q of (page.questions || [])) {
+          const qid = q.id;
+          if (!qid) continue;
+          const qChoices = choiceMap[qid] || {};
+          for (const ans of (q.answers || [])) {
+            const val = resolveAnswer(ans, qChoices);
+            if (val && !qMap[qid]) qMap[qid] = val;
+          }
+        }
       }
 
       // Aplicar filtro (ej: excluir "not answered" en voto)
-     if (colMap.filterCol && colMap.filterVal) {
-  const filterAns = qMap[colMap.filterCol];
-  // DEBUG — primeros 3 casos
-  if (rawCases.length + excluded < 3) {
-    console.log(`[debug-filter] filterCol:${colMap.filterCol} filterAns:"${filterAns}" allKeys:`, Object.keys(qMap));
-  }
-  if (!filterAns || norm(filterAns) === norm(colMap.filterVal)) {
-    excluded++;
-    continue;
-  }
-}
+      if (colMap.filterCol && colMap.filterVal) {
+        const filterAns = qMap[colMap.filterCol];
+        // Excluir si no respondió o respondió el valor de exclusión
+        if (!filterAns || norm(filterAns) === norm(colMap.filterVal)) {
+          excluded++;
+          continue;
+        }
+      }
 
       // Extraer variables clave
       const gen   = qMap[colMap.gen]   || '';
@@ -216,14 +216,7 @@ async function runSync() {
       }
 
       // Saltar si faltan campos críticos
-      // Saltar si faltan campos críticos
-if (!gen || !edad) { 
-  if (rawCases.length === 0 && excluded < 3) {
-    console.log(`[debug] caso excluido — gen:"${gen}" edad:"${edad}" prov:"${prov}" qMap keys:`, Object.keys(qMap).slice(0,5));
-  }
-  excluded++; 
-  continue; 
-}
+      if (!gen || !edad) { excluded++; continue; }
 
       // ID del caso: usar idCol si está mapeado, sino respondent_id
       const caseId = (colMap.idCol && qMap[colMap.idCol])
