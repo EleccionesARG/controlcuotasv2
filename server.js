@@ -186,14 +186,17 @@ async function runSync() {
       }
 
       // Aplicar filtro (ej: excluir "not answered" en voto)
-      if (colMap.filterCol && colMap.filterVal) {
-        const filterAns = qMap[colMap.filterCol];
-        // Excluir si no respondió o respondió el valor de exclusión
-        if (!filterAns || norm(filterAns) === norm(colMap.filterVal)) {
-          excluded++;
-          continue;
-        }
-      }
+     if (colMap.filterCol && colMap.filterVal) {
+  const filterAns = qMap[colMap.filterCol];
+  // DEBUG — primeros 3 casos
+  if (rawCases.length + excluded < 3) {
+    console.log(`[debug-filter] filterCol:${colMap.filterCol} filterAns:"${filterAns}" allKeys:`, Object.keys(qMap));
+  }
+  if (!filterAns || norm(filterAns) === norm(colMap.filterVal)) {
+    excluded++;
+    continue;
+  }
+}
 
       // Extraer variables clave
       const gen   = qMap[colMap.gen]   || '';
