@@ -213,7 +213,14 @@ async function runSync() {
       }
 
       // Saltar si faltan campos críticos
-      if (!gen || !edad) { excluded++; continue; }
+      // Saltar si faltan campos críticos
+if (!gen || !edad) { 
+  if (rawCases.length === 0 && excluded < 3) {
+    console.log(`[debug] caso excluido — gen:"${gen}" edad:"${edad}" prov:"${prov}" qMap keys:`, Object.keys(qMap).slice(0,5));
+  }
+  excluded++; 
+  continue; 
+}
 
       // ID del caso: usar idCol si está mapeado, sino respondent_id
       const caseId = (colMap.idCol && qMap[colMap.idCol])
