@@ -2919,11 +2919,20 @@ function processRawCases(rawCases, muestra){
 // Server MUST send { surveyId: "...", rawCases: [...], lastSync, syncStats }
 function updateSurveyFromFirebase(data){
   if(!data || !APP.activeSurveys) return;
-  if(!data.rawCases && !data.cases) { renderHome(); return; }
 
   // The server must include surveyId so we know which survey to update.
   // If absent (legacy), we fall back to updating only the one active survey.
   const targetId = data.surveyId ? String(data.surveyId) : null;
+
+  // Siempre actualizar lastSync y syncStats aunque no haya casos nuevos
+  APP.activeSurveys.forEach(sv => {
+    if(targetId && String(sv.smSurveyId) !== targetId) return;
+    if(data.lastSync)  sv.lastSync  = data.lastSync;
+    if(data.syncStats) sv.syncStats = data.syncStats;
+  });
+
+  // Si no hay casos, solo refrescar UI con el nuevo timestamp y salir
+  if(!data.rawCases && !data.cases) { renderHome(); updateDashSyncBar(); return; }
 
   let updatedCurrent = false;
 
@@ -2948,8 +2957,11 @@ function updateSurveyFromFirebase(data){
     }
   });
 
-  // Persistir lastSync y syncStats actualizados
-  save();
+  // Persistir timestamps en Firebase para que todos los dispositivos los vean
+  // Usamos un path separado para no interferir con v4sync ni activar _suppressRemote
+  if(window._fbSet && window._fbSyncRef) {
+    // No hacemos nada extra: v4sync ya tiene lastSync y todos lo leen via onValue
+  }
 
   // Refresh currently viewed survey only if it was updated
   if(updatedCurrent && APP.currentSurveyIdx != null){
