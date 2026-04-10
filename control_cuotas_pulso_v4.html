@@ -25,15 +25,12 @@
       const db = getDatabase(app);
       window._fbRef = ref(db, 'pulso/v4');
       window._fbSet = set;
-      window._fbDB  = db;
-      window._fbRefFn = ref;  // guardar la función ref para crear refs dinámicas
       window._fbReady = true;
       // Two listeners: config (dashboard state) + sync (server data)
       const fbConfigRef = ref(db, 'pulso/v4config');
       const fbSyncRef   = ref(db, 'pulso/v4sync');
       window._fbConfigRef = fbConfigRef;
       window._fbSyncRef   = fbSyncRef;
-      // (v4cases eliminado — casos van a v4sync)
 
       // Config listener: restores muestras, activeSurveys, etc.
       onValue(fbConfigRef, (snap) => {
@@ -42,22 +39,11 @@
         try {
           const parsed = JSON.parse(data);
           // Only restore config fields — never case data
-          // Solo restaurar config estructural — cost/n/warnPct viven en activeSurveys[].* 
-          const safe = ['muestras','activeSurveys','activeMuestraId','surveys','nextId'];
+          const safe = ['muestras','activeSurveys','activeMuestraId','n','warnPct','surveys','cost','nextId'];
           safe.forEach(k => { if(parsed[k] !== undefined) APP[k] = parsed[k]; });
-          // Asegurar que los sv restaurados no tienen datos de campo colgados
-          (APP.activeSurveys||[]).forEach(sv => {
-            if(!sv.cases)  sv.cases  = [];
-            if(!sv.quotas) sv.quotas = {};
-            sv._rawCases = null;
-          });
           showSync('ok','● Conectado');
           renderHome();
           renderMuestras();
-          // Ocultar loading overlay — Firebase respondió con datos
-          _fbHideLoading('● Conectado');
-          // Re-registrar syncs activos en Railway (resuelve el problema de server stateless)
-          setTimeout(reRegisterActiveSyncs, 1500);
         } catch(e){ console.warn('Config parse error:', e); }
       });
 
@@ -68,31 +54,25 @@
       onValue(fbSyncRef, (snap) => {
         if(window._suppressRemote) return;
         const root = snap.val();
-        console.log('[Firebase v4sync] tipo:', typeof root, '| keys:', root && typeof root === 'object' ? Object.keys(root) : 'N/A');
-        if(!root) { console.warn('[Firebase v4sync] vacío'); return; }
+        if(!root) return;
         try {
+          // Si es string (legacy: servidor viejo), intentar parsear como único payload
           if(typeof root === 'string'){
-            // Formato legacy: servidor viejo escribía string plano
-            console.log('[Firebase v4sync] formato LEGACY (string)');
             const parsed = JSON.parse(root);
-            console.log('[Firebase v4sync] surveyId en payload:', parsed.surveyId || '(ausente)');
             updateSurveyFromFirebase(parsed);
           } else if(typeof root === 'object'){
-            // Nuevo formato: { surveyId: "string payload", ... }
-            const keys = Object.keys(root);
-            console.log('[Firebase v4sync] formato NUEVO (objeto) con keys:', keys);
-            keys.forEach(sid => {
-              const raw = root[sid];
+            // Nuevo formato: cada key es un surveyId
+            Object.entries(root).forEach(([sid, raw]) => {
               try {
                 const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+                // Garantizar que surveyId esté presente
                 if(!parsed.surveyId) parsed.surveyId = sid;
-                console.log(`[Firebase v4sync] procesando sid=${sid} rawCases=${parsed.rawCases?.length ?? 'none'}`);
                 updateSurveyFromFirebase(parsed);
-              } catch(e){ console.warn('[Firebase v4sync] parse error for', sid, e); }
+              } catch(e){ console.warn('Sync parse error for', sid, e); }
             });
           }
           showSync('sync','● En vivo');
-        } catch(e){ console.warn('[Firebase v4sync] root parse error:', e); }
+        } catch(e){ console.warn('Sync root parse error:', e); }
       });
       showSync('ok','● Conectado');
     } catch(e){ showSync('err','● Error Firebase'); }
@@ -375,7 +355,6 @@ table.dtbl{width:100%;border-collapse:collapse}
 .sync-bar-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;transition:background .3s}
 .sync-bar-dot.on{background:var(--green);box-shadow:0 0 6px var(--green)}
 .sync-bar-dot.off{background:var(--muted2)}
-.sync-bar-dot.warn{background:var(--amber);box-shadow:0 0 6px var(--amber)}
 .sync-bar-label{font-size:12px;font-weight:600;flex:1;min-width:120px}
 .sync-bar-meta{font-family:var(--mono);font-size:10px;color:var(--muted2)}
 .sync-bar-sep{width:1px;height:20px;background:var(--border);flex-shrink:0}
@@ -449,22 +428,6 @@ body.observer-mode .observer-badge{display:inline-block}
 </head>
 <body>
 
-<!-- LOADING OVERLAY — se oculta cuando Firebase responde -->
-<div id="fb-loading" style="position:fixed;inset:0;z-index:9998;background:#0e0e0e;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;transition:opacity .4s">
-  <div style="font-family:'Rubik',sans-serif;font-size:22px;color:#f0ede8;font-weight:600">Control de <em style="color:#3ecf8e">Cuotas</em></div>
-  <div style="font-size:13px;color:#717171;font-family:'JetBrains Mono',monospace" id="fb-loading-msg">Conectando con Firebase...</div>
-  <div style="width:48px;height:3px;background:#1e1e1e;border-radius:2px;overflow:hidden">
-    <div style="height:100%;background:#3ecf8e;border-radius:2px;animation:fbload 1.2s ease-in-out infinite" id="fb-bar"></div>
-  </div>
-</div>
-<style>
-@keyframes fbload {
-  0%{width:0%;margin-left:0}
-  50%{width:60%;margin-left:20%}
-  100%{width:0%;margin-left:100%}
-}
-</style>
-
 <!-- LOGIN -->
 <div id="login-screen">
   <div class="login-box">
@@ -508,7 +471,6 @@ body.observer-mode .observer-badge{display:inline-block}
 
   <div class="nav-sep">Configuración</div>
   <button class="nav-btn" data-p="muestras"><span class="nav-icon">◑</span>Muestras</button>
-  <button class="nav-btn" data-p="nueva-encuesta"><span class="nav-icon">＋</span>Nueva encuesta</button>
   <button class="nav-btn" data-p="sync"><span class="nav-icon">⟳</span>SurveyMonkey</button>
 
   <div class="nav-sep">Archivo</div>
@@ -680,117 +642,11 @@ body.observer-mode .observer-badge{display:inline-block}
   <div class="home-grid" id="home-enc-grid"></div>
 </div>
 
-
-<!-- ══ NUEVA ENCUESTA ══ -->
-<div id="p-nueva-encuesta" class="panel">
-  <div class="pg-head">
-    <div>
-      <div class="pg-title">Nueva encuesta</div>
-      <div class="pg-sub">Creá una encuesta manualmente o conectala a SurveyMonkey</div>
-    </div>
-  </div>
-
-  <!-- PASO 1: Datos básicos -->
-  <div class="card" id="ne-paso1">
-    <div class="card-hd">1 · Datos básicos</div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:10px">
-      <div class="field">
-        <label>Nombre de la encuesta *</label>
-        <input id="ne-nombre" type="text" placeholder="Ej: Consumo Abril 2026" style="width:100%">
-      </div>
-      <div class="field">
-        <label>N objetivo *</label>
-        <input id="ne-n" type="number" min="1" placeholder="Ej: 1500" style="width:100%">
-      </div>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:10px">
-      <div class="field">
-        <label>Muestra</label>
-        <select id="ne-muestra" style="width:100%">
-          <option value="">— Seleccioná muestra —</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>Moneda del presupuesto</label>
-        <select id="ne-moneda" style="width:100%">
-          <option value="$">$ ARS</option>
-          <option value="US$">US$ USD</option>
-          <option value="S/">S/ PEN</option>
-          <option value="CLP$">CLP$ CLP</option>
-        </select>
-      </div>
-    </div>
-    <div style="margin-top:14px" id="ne-muestra-info"></div>
-  </div>
-
-  <!-- PASO 2: Conexión SurveyMonkey (opcional) -->
-  <div class="card" id="ne-paso2">
-    <div class="card-hd" style="display:flex;align-items:center;justify-content:space-between">
-      <span>2 · Conectar a SurveyMonkey <span style="color:var(--muted);font-size:11px;font-weight:400">(opcional)</span></span>
-      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:var(--muted)">
-        <input type="checkbox" id="ne-use-sm" onchange="neToggleSM()" style="accent-color:var(--green)">
-        Conectar a SM
-      </label>
-    </div>
-
-    <div id="ne-sm-fields" style="display:none;margin-top:12px">
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
-        <div class="field">
-          <label>Encuesta en SurveyMonkey</label>
-          <select id="ne-sm-survey" style="width:100%" onchange="neOnSMSurveySelect()">
-            <option value="">— Cargando... —</option>
-          </select>
-          <div style="font-size:10px;color:var(--muted);margin-top:4px" id="ne-sm-survey-meta"></div>
-        </div>
-        <div class="field">
-          <label>Intervalo de sync (min)</label>
-          <input id="ne-interval" type="number" value="15" min="5" max="120" style="width:100%">
-        </div>
-      </div>
-
-      <!-- ColMap rápido -->
-      <div id="ne-colmap-wrap" style="display:none;margin-top:14px">
-        <div style="font-size:11px;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:.08em">Mapeo de columnas</div>
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px" id="ne-colmap-fields"></div>
-        <div id="ne-depto-section" style="display:none;margin-top:12px">
-          <div style="font-size:11px;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:.08em">Departamento por provincia</div>
-          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px" id="ne-depto-map"></div>
-        </div>
-        <div style="margin-top:10px">
-          <label style="font-size:11px;color:var(--muted)">Filtro de elegibilidad</label>
-          <div style="display:flex;gap:8px;margin-top:4px">
-            <select id="ne-filter-col" style="flex:1">
-              <option value="">(no filtrar)</option>
-            </select>
-            <span style="color:var(--muted);padding:6px 4px;font-size:12px">≠</span>
-            <input id="ne-filter-val" type="text" value="not answered" style="width:140px" placeholder="valor a excluir">
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ACCIONES -->
-  <div style="display:flex;gap:10px;align-items:center;margin-top:4px">
-    <button class="btn btn-g" onclick="neCrear()" id="ne-btn-crear">＋ Crear encuesta</button>
-    <button class="btn btn-w" onclick="neReset()">↺ Limpiar</button>
-    <span id="ne-msg" style="font-size:12px;color:var(--green)"></span>
-  </div>
-
-  <!-- ENCUESTAS EXISTENTES: reconectar SM -->
-  <div class="card" style="margin-top:20px" id="ne-existentes-card">
-    <div class="card-hd">Encuestas activas — conectar a SurveyMonkey</div>
-    <div style="font-size:12px;color:var(--muted);margin-bottom:12px">Seleccioná una encuesta ya creada y conectala a SM cuando tengas API disponible.</div>
-    <div id="ne-existentes-list"></div>
-  </div>
-</div>
-
 <!-- ══ CARGAR DATOS ══ -->
 <div id="p-cargar" class="panel">
   <div class="pg-head">
     <div><div class="pg-title">Cargar CSV</div><div class="pg-sub" id="cargar-sub">Importá el export de SurveyMonkey</div></div>
     <button class="btn btn-w" onclick="goPanel('dashboard')" style="display:none" id="btn-ir-dash">← Volver al dashboard</button>
-  <button class="btn btn-w" id="btn-upload-server" onclick="uploadCsvToServer()" style="display:none" title="Procesar este CSV en el servidor y subir a Firebase">⬆ Subir al servidor</button>
   </div>
 
   <!-- Muestra activa -->
@@ -1025,7 +881,7 @@ body.observer-mode .observer-badge{display:inline-block}
     <div class="card-hd">③ Seleccioná la muestra</div>
     <div class="field" style="max-width:400px">
       <label>Muestra a aplicar</label>
-      <select id="sm-muestra-select" style="width:100%" onchange="if(_smQuestions.length) buildDeptoMapUI(_smQuestions)">
+      <select id="sm-muestra-select" style="width:100%">
         <option value="">Seleccioná una muestra...</option>
       </select>
     </div>
@@ -1302,18 +1158,11 @@ body.observer-mode .observer-badge{display:inline-block}
 // ══════════════════════════════════════════
 // ← CAMBIÁ ESTA CONTRASEÑA
 const ACCESS_PASSWORD = "pulso2025";
-const OBSERVER_PASSWORD = "pulso-ver"; // contraseña de solo lectura para socios/clientes
 
 function doLogin(){
   const v=document.getElementById('li-pwd').value;
-  if(v===ACCESS_PASSWORD){
-    document.getElementById('login-screen').style.display='none';
-    sessionStorage.setItem('pa','1');
-  } else if(v===OBSERVER_PASSWORD){
-    document.getElementById('login-screen').style.display='none';
-    sessionStorage.setItem('pa','1');
-    document.body.classList.add('observer-mode');
-  } else {
+  if(v===ACCESS_PASSWORD){ document.getElementById('login-screen').style.display='none'; sessionStorage.setItem('pa','1'); }
+  else {
     const inp=document.getElementById('li-pwd'); const err=document.getElementById('li-err');
     err.textContent='Contraseña incorrecta'; inp.classList.add('shake'); inp.value='';
     setTimeout(()=>inp.classList.remove('shake'),400); inp.focus();
@@ -1340,92 +1189,31 @@ const DFLT = {
 };
 let APP = {...DFLT};
 
-// APP.cases/quotas/cost/n/warnPct se manejan via getCurrentSurvey() — ver helpers abajo
-
-
-// ══════════════════════════════════════════
-// SAVE CASES TO FIREBASE
-// Guarda los casos en pulso/v4sync/{surveyId} — mismo path que Railway,
-// mismo path que ya tiene permisos. Desde el cliente usamos el mismo
-// formato que el server para que sea compatible.
-// ══════════════════════════════════════════
-function saveCases(sv){
-  if(!sv || !sv.smSurveyId) return;
-  if(!window._fbSet || !window._fbDB || !window._fbRefFn) return;
-  if(!sv.cases || !sv.cases.length) return;
-  try {
-    const r = window._fbRefFn(window._fbDB, `pulso/v4sync/${sv.smSurveyId}`);
-    const payload = JSON.stringify({
-      surveyId:  String(sv.smSurveyId),
-      rawCases:  sv.cases,  // casos ya procesados, los guardamos como rawCases
-      lastSync:  new Date().toISOString(),
-      source:    'csv_manual',
-      syncStats: { total: sv.cases.length, valid: sv.cases.length }
-    });
-    window._fbSet(r, payload)
-      .then(() => console.log(`[saveCases] ✓ ${sv.cases.length} casos en Firebase v4sync/${sv.smSurveyId}`))
-      .catch(e => console.warn('[saveCases] error:', e));
-  } catch(e){ console.warn('[saveCases] error:', e); }
-}
 function save(){
   try {
-    // Limpiar cases/_rawCases antes de persistir — son datos de campo (pesados),
-    // no configuración. Se recargan desde Firebase al abrir la encuesta.
-    function stripSurveyData(svList){
-      return (svList||[]).map(sv => {
-        // eslint-disable-next-line no-unused-vars
-        const { cases, _rawCases, ...cfg } = sv;
-        return cfg;
-      });
-    }
-
-    const surveysStripped = stripSurveyData(APP.activeSurveys);
-
-    const appSnap = {
-      muestras:        APP.muestras||[],
-      activeSurveys:   surveysStripped,
-      activeMuestraId: APP.activeMuestraId||null,
-      surveys:         APP.surveys||[],
-      nextId:          APP.nextId||1,
-      _smServerUrl:    APP._smServerUrl||'',
-    };
-
-    try {
-      localStorage.setItem('pulsov4', JSON.stringify(appSnap));
-    } catch(lsErr){
-      console.warn('[save] localStorage falló (¿cuota?):', lsErr.message);
-      showSync('err','● Error al guardar local');
-    }
-
+    localStorage.setItem('pulsov4', JSON.stringify(APP));
+    // Write only config fields to Firebase (not cases)
     const configData = {
-      muestras:        APP.muestras || [],
-      activeSurveys:   surveysStripped,
+      muestras: APP.muestras || [],
+      activeSurveys: APP.activeSurveys || [],
       activeMuestraId: APP.activeMuestraId || null,
-      surveys:         APP.surveys || [],
+      n: APP.n || 2500,
+      warnPct: APP.warnPct || 80,
+      surveys: APP.surveys || [],
+      cost: APP.cost || {},
+      nextId: APP.nextId || 1,
     };
     const fbRef = window._fbConfigRef || window._fbRef;
     if(fbRef && window._fbSet){
       window._suppressRemote = true;
       window._fbSet(fbRef, JSON.stringify(configData))
         .then(()=>{ showSync('ok','● Guardado'); setTimeout(()=>window._suppressRemote=false,1500); })
-        .catch(e=>{ console.warn('[save] Firebase error:', e); showSync('err','● Error sync'); window._suppressRemote=false; });
+        .catch(()=>{ showSync('err','● Error sync'); window._suppressRemote=false; });
     }
-  } catch(e){ console.error('[save] error inesperado:', e); }
+  } catch(e){}
 }
 function load(){
-  try {
-    const d = localStorage.getItem('pulsov4');
-    if(!d) return;
-    const parsed = JSON.parse(d);
-    const SAFE_KEYS = ['muestras','activeSurveys','activeMuestraId','surveys','nextId','_smServerUrl'];
-    SAFE_KEYS.forEach(k => { if(parsed[k] !== undefined) APP[k] = parsed[k]; });
-    // Asegurar que cada sv tiene cases/quotas como arrays vacíos (se recargan desde Firebase)
-    (APP.activeSurveys||[]).forEach(sv => {
-      if(!sv.cases)    sv.cases    = [];
-      if(!sv.quotas)   sv.quotas   = {};
-      sv._rawCases = null;
-    });
-  } catch(e){ console.warn('load() error:', e); }
+  try { const d=localStorage.getItem('pulsov4'); if(d) Object.assign(APP,JSON.parse(d)); } catch(e){}
 }
 
 // ══════════════════════════════════════════
@@ -1436,12 +1224,7 @@ function showSync(type,msg){
   const c={ok:'#5bdb8a',err:'#f08080',sync:'#f0c060',off:'rgba(255,255,255,.2)'};
   el.textContent=msg; el.style.color=c[type]||c.off;
 }
-setTimeout(()=>{ 
-  if(!window._fbReady){ 
-    showSync('off','● Sin Firebase'); 
-    _fbHideLoading('sin Firebase');
-  } 
-},2500);
+setTimeout(()=>{ if(!window._fbReady) showSync('off','● Sin Firebase'); },2500);
 
 // ══════════════════════════════════════════
 // NAV
@@ -1462,8 +1245,8 @@ document.querySelectorAll('.modal-bg').forEach(m=>m.addEventListener('click',e=>
 function norm(s){ return(s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim(); }
 function ck(g,ag,e){ return `${g}||${ag}||${e}`; }
 function cParts(k){ return k.split('||'); }
-function countCell(g,ag,e){ const es=String(e); return getCases().filter(c=>c.gen===g&&c.ageGrp===ag&&String(c.estrato)===es).length; }
-function countJovenes(){ return getCases().filter(c=>parseInt(c.edad)<=29).length; }
+function countCell(g,ag,e){ const es=String(e); return (APP.cases||[]).filter(c=>c.gen===g&&c.ageGrp===ag&&String(c.estrato)===es).length; }
+function countJovenes(){ return APP.cases.filter(c=>parseInt(c.edad)<=29).length; }
 
 function parseAgeBounds(groups){
   return groups.map(g=>{
@@ -1494,63 +1277,24 @@ function normProv(s){ const n=norm(s); return PROV_ALIASES[n]||n; }
 
 // Lookup estrato from active muestra's refTable
 function lookupEst(prov, depto, m){
+  // m can be passed explicitly (for batch processing) or fallback to active muestra
   if(!m) m = getActiveMuestra();
-  if(!m || !m.refTable || !m.refTable.length) return null;
+  if(!m || !m.refTable) return null;
+  const pn = normProv(prov);
 
-  const pn = normProv(prov  || '');
-  const dn = norm    (depto || '');
+  // Fixed overrides
+  if(m.fixedEstrato){ const fo=m.fixedEstrato; if(fo[pn]!==undefined) return fo[pn]; }
 
-  // 1. Fixed overrides (e.g. CABA=1)
-  if(m.fixedEstrato){
-    if(pn && m.fixedEstrato[pn] !== undefined) return String(m.fixedEstrato[pn]);
-    if(dn && m.fixedEstrato[dn] !== undefined) return String(m.fixedEstrato[dn]);
+  const dn = norm(depto);
+  let r;
+  if(m.cobertura==='provincial'||m.cobertura==='municipal'){
+    r = m.refTable.find(x=>norm(x.nivel2)===dn);
+    if(!r) r = m.refTable.find(x=>norm(x.nivel2).includes(dn)||dn.includes(norm(x.nivel2)));
+  } else {
+    r = m.refTable.find(x=>normProv(x.nivel1)===pn&&norm(x.nivel2)===dn);
+    if(!r) r = m.refTable.find(x=>normProv(x.nivel1)===pn&&(norm(x.nivel2).includes(dn)||dn.includes(norm(x.nivel2))));
   }
-
-  const rt = m.refTable;
-  const eq  = (a, b) => a === b;
-  const inc = (a, b) => a.length > 0 && b.length > 0 && (a.includes(b) || b.includes(a));
-
-  // Detectar si la tabla tiene nivel1 poblado (tabla nacional/dos niveles)
-  const hasNivel1 = rt.some(x => x.nivel1 && x.nivel1.trim() !== '');
-
-  let r = null;
-
-  // ── Estrategia 1: nivel1 + nivel2 (tabla nacional: prov+depto)
-  if(hasNivel1 && pn && dn){
-    r = rt.find(x => eq(normProv(x.nivel1), pn) && eq(norm(x.nivel2), dn));
-    if(!r) r = rt.find(x => eq(normProv(x.nivel1), pn) && inc(norm(x.nivel2), dn));
-    if(!r) r = rt.find(x => inc(normProv(x.nivel1), pn) && inc(norm(x.nivel2), dn));
-  }
-  if(r) return String(r.estrato);
-
-  // ── Estrategia 2: solo nivel2 (tabla provincial/subnacional sin nivel1)
-  //    SOLO si la tabla no tiene nivel1, o si depto está vacío y prov coincide con nivel2
-  if(!hasNivel1){
-    // Tabla de una sola columna geográfica — buscar pn o dn en nivel2
-    const val = dn || pn;
-    if(val){
-      r = rt.find(x => eq(norm(x.nivel2), val));
-      if(!r) r = rt.find(x => inc(norm(x.nivel2), val));
-    }
-  } else if(hasNivel1 && !dn && pn){
-    // Tabla nacional pero no hay depto — el campo prov podría ser el depto
-    // (caso Perú: departamento llegó como prov)
-    r = rt.find(x => eq(norm(x.nivel2), pn));
-    if(!r) r = rt.find(x => inc(norm(x.nivel2), pn));
-    // También buscar por nivel1 directo (prov coincide con nivel1)
-    if(!r) r = rt.find(x => eq(normProv(x.nivel1), pn));
-    if(!r) r = rt.find(x => inc(normProv(x.nivel1), pn));
-  }
-  if(r) return String(r.estrato);
-
-  // ── Estrategia 3: tabla nacional, solo prov (sin depto en tabla)
-  if(hasNivel1 && pn && rt.every(x => !x.nivel2 || x.nivel2 === '')){
-    r = rt.find(x => eq(normProv(x.nivel1), pn));
-    if(!r) r = rt.find(x => inc(normProv(x.nivel1), pn));
-  }
-  if(r) return String(r.estrato);
-
-  return null;
+  return r?(r.estrato!==null&&r.estrato!==undefined?String(r.estrato):null):null;
 }
 
 // ══════════════════════════════════════════
@@ -1558,12 +1302,7 @@ function lookupEst(prov, depto, m){
 // ══════════════════════════════════════════
 let _refRows=[], _editingMuestraId=null;
 
-function getActiveMuestra(){
-  // Si hay encuesta activa, usar su muestra; si no, la global
-  const sv = getCurrentSurvey();
-  const mId = sv ? sv.muestraId : APP.activeMuestraId;
-  return APP.muestras.find(m=>m.id===mId)||null;
-}
+function getActiveMuestra(){ return APP.muestras.find(m=>m.id===APP.activeMuestraId)||null; }
 
 function openNewMuestra(){
   _editingMuestraId=null; _refRows=[];
@@ -1633,16 +1372,16 @@ function applyRef(){
     // 2 columns: nivel2 → estrato
     di=parseInt(document.getElementById('rc-nivel2')?.value??0);
     ei=parseInt(document.getElementById('rc-estrato')?.value??1);
-    const refTable=_refRows.slice(1).filter(r=>r[di] && (r[ei]!==undefined && r[ei]!==null && r[ei].trim()!=='')).map(r=>({nivel1:'',nivel2:r[di].trim(),estrato:r[ei].trim()}));
-    const estratos=[...new Set(refTable.map(r=>r.estrato).filter(x => x !== null && x !== undefined && x !== ''))].sort((a,b)=>{const na=parseInt(a),nb=parseInt(b);return(!isNaN(na)&&!isNaN(nb))?na-nb:String(a).localeCompare(String(b));});
+    const refTable=_refRows.slice(1).filter(r=>r[di]&&r[ei]).map(r=>({nivel1:'',nivel2:r[di].trim(),estrato:r[ei].trim()}));
+    const estratos=[...new Set(refTable.map(r=>r.estrato))].sort();
     // Store temporarily in a global for saveMuestra to pick up
     window._pendingRef = { refTable, estratos };
   } else {
     pi=parseInt(document.getElementById('rc-nivel1')?.value??0);
     di=parseInt(document.getElementById('rc-nivel2')?.value??1);
     ei=parseInt(document.getElementById('rc-estrato')?.value??2);
-    const refTable=_refRows.slice(1).filter(r=>r[pi] && r[di] && (r[ei]!==undefined && r[ei]!==null && r[ei].trim()!=='')).map(r=>({nivel1:r[pi].trim(),nivel2:r[di].trim(),estrato:r[ei].trim()}));
-    const estratos=[...new Set(refTable.map(r=>r.estrato).filter(x => x !== null && x !== undefined && x !== ''))].sort((a,b)=>{const na=parseInt(a),nb=parseInt(b);return(!isNaN(na)&&!isNaN(nb))?na-nb:String(a).localeCompare(String(b));});
+    const refTable=_refRows.slice(1).filter(r=>r[pi]&&r[di]&&r[ei]).map(r=>({nivel1:r[pi].trim(),nivel2:r[di].trim(),estrato:r[ei].trim()}));
+    const estratos=[...new Set(refTable.map(r=>r.estrato))].sort();
     window._pendingRef = { refTable, estratos };
   }
   const {refTable,estratos}=window._pendingRef;
@@ -1735,7 +1474,7 @@ function updatePctTotals(){
   if(!estratos.length){
     // try to infer from inputs
     const keys=[...document.querySelectorAll('.pct-inp')].map(i=>i.dataset.key);
-    estratos=[...new Set(keys.map(k=>cParts(k)[2]))].filter(x => x !== null && x !== undefined && x !== '').sort();
+    estratos=[...new Set(keys.map(k=>cParts(k)[2]))].filter(Boolean).sort();
   }
   let grandTotal=0;
 
@@ -1777,7 +1516,7 @@ function onPctKey(e,inp){
   const agesRaw=document.getElementById('mm-ages').value.split(',').map(s=>s.trim()).filter(Boolean);
   const nc=agesRaw.length; // cols = ages
   let estratos=window._pendingRef?window._pendingRef.estratos:[];
-  if(!estratos.length){ estratos=[...new Set([...document.querySelectorAll('.pct-inp')].map(i=>cParts(i.dataset.key||'||')[2]).filter(x => x !== null && x !== undefined && x !== ''))].sort((a,b)=>{const na=parseInt(a),nb=parseInt(b);return(!isNaN(na)&&!isNaN(nb))?na-nb:String(a).localeCompare(String(b));}); }
+  if(!estratos.length){ estratos=[...new Set([...document.querySelectorAll('.pct-inp')].map(i=>cParts(i.dataset.key||'||')[2]).filter(Boolean))].sort(); }
   const nr=estratos.length, ng=2; // rows = estratos
   let r2=r,c2=c,g2=gi;
   if(e.key==='Tab'||e.key==='ArrowRight'){ e.preventDefault(); if(c<nc-1)c2=c+1; else if(r<nr-1){c2=0;r2=r+1;} else if(gi<ng-1){g2=gi+1;c2=0;r2=0;} }
@@ -1868,8 +1607,8 @@ function saveMuestra(){
 function openActivateModal(id){
   const m=APP.muestras.find(x=>x.id===id); if(!m)return;
   document.getElementById('act-modal-desc').textContent=`Muestra: ${m.nombre} · ${m.estratos.length} estratos · ${(m.ageGroups||[]).join(', ')}`;
-  document.getElementById('act-n').value=getCurrentSurvey()?.n||2500;
-  document.getElementById('act-warn').value=getCurrentSurvey()?.warnPct||80;
+  document.getElementById('act-n').value=APP.n||2500;
+  document.getElementById('act-warn').value=APP.warnPct||80;
   document.getElementById('activate-modal').dataset.muestraId=id;
   previewActivate(id);
   openModal('activate-modal');
@@ -1905,22 +1644,10 @@ function confirmActivate(){
   const quotas={};
   Object.entries(m.distribution||{}).forEach(([k,pct])=>{ quotas[k]=Math.round(pct/100*n); });
 
-  APP.activeMuestraId = id;
-  const _svAct = getCurrentSurvey();
-  if(_svAct){
-    // Actualizar la encuesta activa con la nueva muestra, N y cuotas
-    _svAct.muestraId  = id;
-    _svAct.n          = n;
-    _svAct.warnPct    = warnPct;
-    _svAct.quotas     = quotas;
-    // Reprocessar casos existentes con la nueva muestra
-    const m2 = APP.muestras.find(x => x.id === id);
-    if(m2 && _svAct._rawCases?.length){
-      _svAct.cases = processRawCases(_svAct._rawCases, m2);
-    } else if(m2 && _svAct.cases?.length){
-      _svAct.cases = processRawCases(_svAct.cases, m2);
-    }
-  }
+  APP.activeMuestraId=id;
+  APP.n=n;
+  APP.warnPct=warnPct;
+  APP.quotas=quotas;
   save();
   closeModal('activate-modal');
   renderMuestras();
@@ -1944,12 +1671,10 @@ function renderMuestras(){
     return;
   }
   const cobLabels={nacional:'Nacional',provincial:'Provincial',municipal:'Municipal',custom:'Personalizada'};
-  // La muestra "activa" es la de la encuesta activa (si hay una), o la global
-  const _activeMId = getCurrentSurvey()?.muestraId ?? APP.activeMuestraId;
   container.innerHTML=APP.muestras.map(m=>`
-    <div class="muestra-card ${m.id===_activeMId?'active-muestra':''}">
+    <div class="muestra-card ${m.id===APP.activeMuestraId?'active-muestra':''}">
       <div>
-        <div class="mc-name">${m.nombre} ${m.id===_activeMId?'<span class="pill pill-g">● Activa</span>':''}</div>
+        <div class="mc-name">${m.nombre} ${m.id===APP.activeMuestraId?'<span class="pill pill-g">● Activa</span>':''}</div>
         <div class="mc-scope">${cobLabels[m.cobertura]||m.cobertura} · ${m.estratos.join(', ')} → ${(m.ageGroups||[]).join(', ')}</div>
         <div class="mc-stats">
           <span class="mc-stat">${m.estratos.length} estratos</span>
@@ -1974,7 +1699,7 @@ function updateCargarMuestraInfo(){
   const m=getActiveMuestra();
   if(!m){ el.innerHTML=`<div class="al al-a">⚠ No hay muestra activa. Seleccioná una en <strong>Muestras</strong> antes de cargar datos.</div>`; return; }
   const cobLabels={nacional:'Prov → Depto → Estrato',provincial:'Depto → Estrato',municipal:'Localidad → Estrato',custom:'Nivel1 → Nivel2 → Estrato'};
-  el.innerHTML=`<div class="al al-g">✓ Muestra activa: <strong>${m.nombre}</strong> · ${cobLabels[m.cobertura]} · N=${getCurrentN().toLocaleString('es-AR')}</div>`;
+  el.innerHTML=`<div class="al al-g">✓ Muestra activa: <strong>${m.nombre}</strong> · ${cobLabels[m.cobertura]} · N=${APP.n.toLocaleString('es-AR')}</div>`;
 }
 
 // ══════════════════════════════════════════
@@ -2059,7 +1784,7 @@ function buildProvDeptoMap(headers,rows){
   const m=getActiveMuestra();
   let provs=[];
   if(m&&m.refTable.length&&(m.cobertura==='nacional'||m.cobertura==='custom')){
-    provs=[...new Set(m.refTable.map(r=>r.nivel1))].filter(x => x !== null && x !== undefined && x !== '').sort();
+    provs=[...new Set(m.refTable.map(r=>r.nivel1))].filter(Boolean).sort();
   } else {
     const pi=findColIdx(headers,['provincia','province','prov']);
     provs=[...new Set(rows.slice(1).map(r=>(r[pi>=0?pi:0]||'').trim()).filter(Boolean))].sort();
@@ -2096,8 +1821,7 @@ function processSurvey(){
 
   let added=0, noEst=0, excluded=0, dupes=0;
   const newCases=[];
-  const _svForId = getCurrentSurvey();
-  let nextId = (_svForId?.nextId) || APP.nextId || 1;
+  let nextId = APP.nextId || 1;
 
   _svRows.slice(1).forEach(row=>{
     const gen=(row[genIdx]||'').trim();
@@ -2126,7 +1850,7 @@ function processSurvey(){
   let finalCases;
   if(mode==='append'){
     // Deduplicate: always read from the active survey, not APP.cases (stale risk)
-    const _svCases = getCurrentSurvey()?.cases || [];
+    const _svCases = getCurrentSurvey()?.cases || APP.cases || [];
     const existingIds = new Set(_svCases.map(c=>String(c.id)));
     const toAdd = newCases.filter(c=>{ if(existingIds.has(String(c.id))){ dupes++; return false; } return true; });
     finalCases = [..._svCases, ...toAdd];
@@ -2135,24 +1859,22 @@ function processSurvey(){
     finalCases = newCases;
   }
 
-  // Con el proxy, asignar a APP.cases ya escribe en sv.cases automáticamente
-  // Con el getter, escribir en sv.cases directamente
-  const _svCSV = getCurrentSurvey();
-  if(_svCSV){
-    _svCSV.cases = finalCases;
-    _svCSV.nextId = nextId;
-    _svCSV._rawCases = null;
-    // Guardar casos en Firebase para que persistan tras F5
-    saveCases(_svCSV);
-  }
+  APP.cases = finalCases;
   APP.nextId = nextId;
+
+  // Update active survey
+  if(APP.currentSurveyIdx != null && APP.activeSurveys?.[APP.currentSurveyIdx]){
+    const sv = APP.activeSurveys[APP.currentSurveyIdx];
+    sv.cases = [...APP.cases];
+    sv._rawCases = null;
+  }
 
   // Result message
   let msg = `<span style="color:var(--green)">✓ ${added} casos ${mode==='append'?'agregados':'cargados'}</span>`;
   if(excluded) msg += ` · ${excluded} excluidos`;
   if(dupes)    msg += ` · <span style="color:var(--muted)">${dupes} ya existían</span>`;
   if(noEst)    msg += ` · <span style="color:var(--amber)">${noEst} sin estrato</span>`;
-  msg += ` · <strong style="color:var(--text)">Total: ${getCases().length}</strong>`;
+  msg += ` · <strong style="color:var(--text)">Total: ${APP.cases.length}</strong>`;
 
   const msgEl=document.getElementById('sv-proc-msg');
   if(msgEl) msgEl.innerHTML = msg;
@@ -2193,7 +1915,7 @@ function renderAll(){
   renderSidebar();
   renderProvincias();
   const jEl=document.getElementById('kpi-jovenes'); if(jEl)jEl.textContent=countJovenes().toLocaleString('es-AR');
-  _renderCostDisplay(); // solo display, no guarda
+  updateCost();
   updateDashSyncBar();
 }
 
@@ -2215,10 +1937,14 @@ function renderDash(){
   const titleEl=document.getElementById('dash-title');
   if(titleEl) titleEl.textContent = sv ? sv.smTitle || m?.nombre || 'Dashboard' : m?.nombre || 'Dashboard';
 
-  const quotas = sv ? (sv.quotas||{}) : {};
-  const cases  = sv ? (sv.cases||[])  : [];
+  const quotas = sv ? (sv.quotas||{}) : (APP.quotas||{});
+  const cases  = sv ? (sv.cases||[])  : (APP.cases||[]);
 
-  // APP.cases y APP.quotas son proxies — ya apuntan a sv automáticamente
+  // Keep APP in sync with active survey so helper functions (countCell etc.) work correctly
+  if(sv){
+    APP.quotas = quotas;
+    APP.cases  = cases;
+  }
 
   const keys = Object.keys(quotas).filter(k=>quotas[k]>0);
   const totTgt = Object.values(quotas).reduce((a,b)=>a+b,0);
@@ -2230,7 +1956,7 @@ function renderDash(){
     const[g,ag,e]=cParts(k);
     const tgt=quotas[k], cur=cases.filter(c=>c.gen===g&&c.ageGrp===ag&&String(c.estrato)===String(e)).length;
     const pf=tgt>0?cur/tgt:0;
-    const st=pf>=1?'full':(pf*100>=getWarnPct()?'warn':'ok');
+    const st=pf>=1?'full':(pf*100>=(APP.warnPct||80)?'warn':'ok');
     return{k,g,ag,e,tgt,cur,pf,st};
   });
   const closed=cells.filter(c=>c.st==='full').length;
@@ -2253,7 +1979,7 @@ function renderDash(){
   const progEl=el('dash-prog');
   if(progEl&&totTgt>0){
     const pv=Math.min(pct??0,100);
-    const bc=pv>=100?'var(--red)':pv>=getWarnPct()?'var(--amber)':'var(--green)';
+    const bc=pv>=100?'var(--red)':pv>=(APP.warnPct||80)?'var(--amber)':'var(--green)';
     progEl.innerHTML=`<div class="prog-wrap">
       <div class="prog-header"><span class="prog-label">Avance total del campo</span><span class="prog-pct" style="color:${bc}">${pv}%</span></div>
       <div class="prog-track"><div class="prog-fill" style="width:${pv}%;background:${bc}"></div></div>
@@ -2329,9 +2055,9 @@ function renderQuotaGrid(cells, m){
   const cellMap={};
   cells.forEach(c=>{
     // Recompute cur from APP.cases to ensure fresh data
-    c.cur = getCases().filter(x=>x.gen===c.g&&x.ageGrp===c.ag&&String(x.estrato)===String(c.e)).length;
+    c.cur = (APP.cases||[]).filter(x=>x.gen===c.g&&x.ageGrp===c.ag&&String(x.estrato)===String(c.e)).length;
     c.pf = c.tgt>0?c.cur/c.tgt:0;
-    c.st = c.pf>=1?'full':(c.pf*100>=getWarnPct()?'warn':'ok');
+    c.st = c.pf>=1?'full':(c.pf*100>=(APP.warnPct||80)?'warn':'ok');
     cellMap[c.k]=c;
   });
 
@@ -2339,8 +2065,8 @@ function renderQuotaGrid(cells, m){
     if(!tgt) return `<div class="qcell-wrap cs-empty"><div class="qcell-top"><span class="qcell-cur">—</span><span class="qcell-pct-badge">—</span></div></div>`;
     const pf=Math.min(cur/tgt,1);
     const pct=Math.round(pf*100);
-    const st=pf>=1?'cs-full':pf*100>=getWarnPct()?'cs-warn':cur>0?'cs-ok':'cs-empty';
-    const icon=pf>=1?'✓ ':pf*100>=getWarnPct()?'':'';
+    const st=pf>=1?'cs-full':pf*100>=APP.warnPct?'cs-warn':cur>0?'cs-ok':'cs-empty';
+    const icon=pf>=1?'✓ ':pf*100>=APP.warnPct?'':'';
     if(compact) return `<div class="qcell-wrap ${st}" style="padding:8px 12px;min-width:90px">
       <div class="qcell-top" style="margin-bottom:4px"><span class="qcell-cur" style="font-size:18px">${cur}</span><span class="qcell-pct-badge" style="font-size:10px">${pct}%</span></div>
       <div class="qcell-tgt" style="font-size:10px;margin-bottom:4px">de ${tgt}</div>
@@ -2402,7 +2128,7 @@ function renderQuotaGrid(cells, m){
             const done=rowTotals[ri].tgt>0&&rowTotals[ri].cur>=rowTotals[ri].tgt;
             return`<tr style="${done?'opacity:.55':''}">
             <td class="td-label">${done?'✓ ':''} Estrato ${e}</td>
-            ${ages.map(ag=>{const c=cellMap[ck(g,ag,e)]||{cur:0,tgt:getQuotas()[ck(g,ag,e)]||0};return`<td>${cellHtml(c.cur,c.tgt,_compact)}</td>`;}).join('')}
+            ${ages.map(ag=>{const c=cellMap[ck(g,ag,e)]||{cur:0,tgt:APP.quotas[ck(g,ag,e)]||0};return`<td>${cellHtml(c.cur,c.tgt,_compact)}</td>`;}).join('')}
             <td class="td-total">${cellHtml(rowTotals[ri].cur,rowTotals[ri].tgt,_compact)}</td>
           </tr>`;}).join('')}
         </tbody>
@@ -2427,8 +2153,7 @@ function clearTableFilters(){
 }
 function renderTable(){
   const tbody=document.getElementById('tbl-body'); if(!tbody)return;
-  const _rtCases=getCases(); const _rtQuotas=getQuotas();
-  const tot=_rtCases.length;
+  const tot=APP.cases.length;
   const el=id=>document.getElementById(id);
   if(el('tbl-count'))el('tbl-count').textContent=tot.toLocaleString('es-AR');
   if(el('casos-sub'))el('casos-sub').textContent=tot>0?`${tot.toLocaleString('es-AR')} casos procesados`:'Sin datos';
@@ -2438,7 +2163,7 @@ function renderTable(){
   if(fEst){
     const cur=fEst.value;
     const m=getActiveMuestra();
-    const estratos=m?m.estratos:[...new Set(_rtCases.map(c=>c.estrato))].sort();
+    const estratos=m?m.estratos:[...new Set(APP.cases.map(c=>c.estrato))].sort();
     fEst.innerHTML='<option value="">Todos los estratos</option>'+estratos.map(e=>`<option value="${e}" ${cur===e?'selected':''}>Estrato ${e}</option>`).join('');
   }
 
@@ -2449,14 +2174,14 @@ function renderTable(){
   const fEstVal=el('tbl-f-est')?.value||'';
   const fEstado=el('tbl-f-estado')?.value||'';
 
-  let filtered=_rtCases.slice().reverse();
+  let filtered=APP.cases.slice().reverse();
   if(search) filtered=filtered.filter(c=>(c.id||'').toLowerCase().includes(search)||(c.prov||'').toLowerCase().includes(search)||(c.depto||'').toLowerCase().includes(search));
   if(fGen) filtered=filtered.filter(c=>c.gen===fGen);
   if(fEstVal) filtered=filtered.filter(c=>c.estrato===fEstVal);
   if(fEstado){
     filtered=filtered.filter(c=>{
-      const tgt=_rtQuotas[c.key]||0;
-      const exc=tgt>0&&_rtCases.filter(x=>x.key===c.key).length>tgt;
+      const tgt=APP.quotas[c.key]||0;
+      const exc=tgt>0&&APP.cases.filter(x=>x.key===c.key).length>tgt;
       const noE=c.estrato==='?';
       if(fEstado==='ok')return !exc&&!noE;
       if(fEstado==='excede')return exc;
@@ -2469,15 +2194,15 @@ function renderTable(){
 
   const display=filtered.slice(0,500), hidden=filtered.length-display.length;
   tbody.innerHTML=display.map(c=>{
-    const origIdx=_rtCases.indexOf(c);
-    const tgt=_rtQuotas[c.key]||0;
-    const exc=tgt>0&&_rtCases.filter(x=>x.key===c.key).length>tgt;
+    const origIdx=APP.cases.indexOf(c);
+    const tgt=APP.quotas[c.key]||0;
+    const exc=tgt>0&&APP.cases.filter(x=>x.key===c.key).length>tgt;
     const noE=c.estrato==='?';
     const gTag=c.gen==='Masculino'?'tag-m':c.gen==='Femenino'?'tag-f':'tag-nb';
     const stC=noE?'var(--amber)':exc?'var(--red)':'var(--green)';
     const stT=noE?'⚠ Sin est.':exc?'⚠ Excede':'✓ OK';
     return`<tr class="${exc?'tr-bad':noE?'tr-noest':''}">
-      <td class="td-dim">${_rtCases.length-_rtCases.indexOf(c)}</td>
+      <td class="td-dim">${APP.cases.length-APP.cases.indexOf(c)}</td>
       <td>${c.id}</td>
       <td><span class="tag ${gTag}">${c.gen}</span></td>
       <td>${c.edad}</td><td>${c.ageGrp}</td>
@@ -2510,21 +2235,20 @@ function renderSidebar(){
 }
 
 function rmCase(i){
-  getCases().splice(i,1);
-  const _svRm = getCurrentSurvey();
-  if(_svRm) saveCases(_svRm);
+  APP.cases.splice(i,1);
+  // Write back to the active survey so changes persist per-survey
+  const sv=getCurrentSurvey(); if(sv) sv.cases=[...APP.cases];
   save();renderAll();
 }
 function clearCases(){
   if(!confirm('¿Borrar todos los casos?'))return;
-  const _svCC=getCurrentSurvey();
-  if(_svCC){ _svCC.cases=[]; _svCC._rawCases=null; _svCC.nextId=1; saveCases(_svCC); }
-  APP.nextId=1;
+  APP.cases=[];APP.nextId=1;
+  const sv=getCurrentSurvey(); if(sv){ sv.cases=[]; sv._rawCases=null; }
   save();renderAll();
 }
 function exportCSV(){
   const rows=[['#','ID','Genero','Edad','GrupoEdad','Nivel1','Nivel2','Estrato','Celda']];
-  getCases().forEach((c,i)=>rows.push([i+1,c.id,c.gen,c.edad,c.ageGrp,c.prov||'',c.depto||'',c.estrato,`${c.gen}/${c.ageGrp}/E${c.estrato}`]));
+  APP.cases.forEach((c,i)=>rows.push([i+1,c.id,c.gen,c.edad,c.ageGrp,c.prov||'',c.depto||'',c.estrato,`${c.gen}/${c.ageGrp}/E${c.estrato}`]));
   const csv=rows.map(r=>r.map(v=>`"${v||''}"`).join(',')).join('\n');
   const a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob(['\uFEFF'+csv],{type:'text/csv;charset=utf-8;'}));
@@ -2562,14 +2286,10 @@ function addManual(){
   const _estM=lookupEst(prov,depto); const estrato=(_estM!==null&&_estM!==undefined)?String(_estM):'?';
   const ageGrp=getAgeGrp(edad,m.ageBounds,m.ageGroups);
   const key=ck(gen,ageGrp,estrato);
-  const tgt=getQuotas()[key]||0;
+  const tgt=APP.quotas[key]||0;
   if(tgt>0&&countCell(gen,ageGrp,estrato)>=tgt&&!confirm(`⚠ Cuota completa. ¿Agregás igual?`))return;
-  const _svAC=getCurrentSurvey(); if(_svAC){
-    if(!_svAC.nextId) _svAC.nextId=1;
-    getCases().push({id:idRaw||`R${String(_svAC.nextId).padStart(4,'0')}`,gen,edad,ageGrp,prov,depto,estrato,key,ts:Date.now()});
-    _svAC.nextId++;
-    saveCases(_svAC); // persistir en Firebase
-  }
+  APP.cases.push({id:idRaw||`R${String(APP.nextId).padStart(4,'0')}`,gen,edad,ageGrp,prov,depto,estrato,key,ts:Date.now()});
+  APP.nextId++;
   document.getElementById('m-edad').value=''; document.getElementById('m-id').value='';
   save();renderAll();
 }
@@ -2581,7 +2301,7 @@ function renderProvincias(){
   const wrap=document.getElementById('prov-table-wrap'); if(!wrap)return;
   const sumWrap=document.getElementById('prov-summary');
   const m=getActiveMuestra();
-  const cases=getCases();
+  const cases=APP.cases;
   if(!cases.length){ wrap.innerHTML='<div class="empty-state"><div class="empty-icon">⊛</div><div class="empty-sub">No hay casos cargados.</div></div>'; if(sumWrap)sumWrap.innerHTML=''; return; }
   const ages=m?(m.ageGroups||[]):[...new Set(cases.map(c=>c.ageGrp))].sort();
   const generos=['Masculino','Femenino'];
@@ -2645,98 +2365,56 @@ function toggleCostPanel(){
   const p=document.getElementById('cost-panel');
   if(p) p.style.display=p.style.display==='none'?'block':'none';
 }
-// Helpers per-survey: siempre leer/escribir de getCurrentSurvey()
-function getSvCost(){ 
-  const sv = getCurrentSurvey(); 
-  return sv ? (sv.cost || {}) : {}; 
-}
-function setSvCost(c){ 
-  const sv = getCurrentSurvey(); 
-  if(sv){ sv.cost = c; save(); }
-}
-function getWarnPct(){ 
-  const sv = getCurrentSurvey(); 
-  return sv ? (sv.warnPct || 80) : 80; 
-}
-function setWarnPct(v){ 
-  const sv = getCurrentSurvey(); 
-  if(sv){ sv.warnPct = v; save(); }
-}
+function updateCost(){
+  const base=parseFloat(document.getElementById('cost-total')?.value)||0;
+  const moneda=document.getElementById('cost-moneda')?.value||'$';
+  const ivaOn=document.getElementById('cost-iva-toggle')?.checked||false;
+  const casos=(getCurrentSurvey()?.cases||APP.cases||[]).length;
+  const nObj=getCurrentN?getCurrentN():(APP.n||0);
 
-// _renderCostDisplay: solo actualiza el DOM a partir del costo guardado en sv
-// NO lee del input, NO guarda nada. Seguro de llamar desde renderAll().
-function _renderCostDisplay(){
-  const _cost = getSvCost();
-  const base = _cost.totalReal && _cost.mult ? (_cost.total || 0) : 0;
-  const totalReal = _cost.totalReal || 0;
-  const moneda = _cost.moneda || '$';
-  const ivaOn = _cost.ivaOn || false;
-  const casos = getCases().length;
-  const nObj = getCurrentN();
-  const mult = _cost.mult || 1.08;
+  // Fee Meta es siempre 8%, IVA 21% opcional
+  const mult = ivaOn ? (1.08 * 1.21) : 1.08;
+  const totalReal = base * mult;
+
+  // Guardar con flags
+  APP.cost={total:base,totalReal,moneda,ivaOn,mult,fecha:new Date().toLocaleDateString('es-AR')};
+  save();
 
   const fmt=v=>v>0?`${moneda} ${Math.round(v).toLocaleString('es-AR')}`:'—';
-  const porCaso=casos>0&&totalReal>0?totalReal/casos:0;
+  const porCaso=casos>0?totalReal/casos:0;
   const estimado=porCaso>0&&nObj>0?porCaso*nObj:0;
   const restante=porCaso>0&&nObj>casos?porCaso*(nObj-casos):0;
 
   const el=id=>document.getElementById(id);
+
+  // Toggle visual del IVA
   const slider=el('cost-iva-slider'), knob=el('cost-iva-knob');
   if(slider) slider.style.background=ivaOn?'rgba(0,229,160,.3)':'var(--s4)';
   if(slider) slider.style.borderColor=ivaOn?'var(--green-b)':'var(--b2)';
   if(knob)   knob.style.background=ivaOn?'var(--green)':'var(--muted2)';
   if(knob)   knob.style.transform=ivaOn?'translateX(16px)':'translateX(0)';
   if(el('cost-iva-lbl')) el('cost-iva-lbl').textContent=ivaOn?'incluido':'no aplica';
-  if(el('cost-total-real')) el('cost-total-real').textContent=totalReal>0?fmt(totalReal):'—';
+
+  // Costo total real con cargas
+  if(el('cost-total-real')) el('cost-total-real').textContent=base>0?fmt(totalReal):'—';
   const multLabel = ivaOn ? `× ${mult.toFixed(4)} (8% + IVA 21%)` : '× 1.08 (fee Meta)';
   if(el('cost-mult-lbl')) el('cost-mult-lbl').textContent=multLabel;
+
   if(el('cost-por-caso'))  el('cost-por-caso').textContent=fmt(porCaso);
   if(el('cost-estimado'))  el('cost-estimado').textContent=fmt(estimado);
   if(el('cost-restante'))  el('cost-restante').textContent=restante>0?fmt(restante):'✓ Completado';
-  if(el('cost-fecha'))     el('cost-fecha').textContent=_cost.fecha||'—';
+  if(el('cost-fecha'))     el('cost-fecha').textContent=APP.cost.fecha||'—';
   if(el('kpi-costo'))      el('kpi-costo').textContent=porCaso>0?`${moneda} ${Math.round(porCaso).toLocaleString('es-AR')}`:'—';
 }
-
-// updateCost: llamada SOLO por interacción del usuario (oninput/onchange del widget)
-// Lee del DOM, GUARDA en sv, luego renderiza.
-function updateCost(){
-  const sv = getCurrentSurvey();
-  if(!sv) return; // no hay encuesta activa, no guardar nada
-
-  const base=parseFloat(document.getElementById('cost-total')?.value)||0;
-  const moneda=document.getElementById('cost-moneda')?.value||'$';
-  const ivaOn=document.getElementById('cost-iva-toggle')?.checked||false;
-  const mult = ivaOn ? (1.08 * 1.21) : 1.08;
-  const totalReal = base * mult;
-
-  // Guardar siempre que el usuario interactúa (aunque borre el valor → guarda 0 para limpiar)
-  sv.cost = {total:base, totalReal, moneda, ivaOn, mult,
-             fecha: base>0 ? new Date().toLocaleDateString('es-AR') : (sv.cost?.fecha||'')};
-  save();
-
-  _renderCostDisplay();
-}
 function renderCostWidget(){
+  if(!APP.cost)return;
   const el=id=>document.getElementById(id);
-  const _cost = getSvCost();
-
-  // SIEMPRE limpiar primero — evita que valores de otra encuesta queden en el DOM
-  if(el('cost-total'))  el('cost-total').value  = _cost.total  || '';
-  if(el('cost-moneda')) el('cost-moneda').value  = _cost.moneda || '$';
+  if(el('cost-total'))  el('cost-total').value=APP.cost.total||'';
+  if(el('cost-moneda')) el('cost-moneda').value=APP.cost.moneda||'$';
+  // Restore IVA toggle state
   const ivaToggle=el('cost-iva-toggle');
-  if(ivaToggle) ivaToggle.checked = _cost.ivaOn || false;
-
-  // Limpiar displays calculados si no hay presupuesto
-  if(!_cost.total){
-    if(el('cost-total-real')) el('cost-total-real').textContent='—';
-    if(el('cost-por-caso'))   el('cost-por-caso').textContent='—';
-    if(el('cost-estimado'))   el('cost-estimado').textContent='—';
-    if(el('cost-restante'))   el('cost-restante').textContent='—';
-    if(el('cost-fecha'))      el('cost-fecha').textContent='—';
-    if(el('kpi-costo'))       el('kpi-costo').textContent='—';
-    return;
-  }
-  _renderCostDisplay();
+  if(ivaToggle) ivaToggle.checked=APP.cost.ivaOn||false;
+  updateCost();
 }
 
 // ══════════════════════════════════════════
@@ -2747,14 +2425,14 @@ function confirmSaveSurvey(){
   if(!titulo){alert('Ingresá un título.');return;}
   const notas=(document.getElementById('enc-notas')?.value||'').trim();
   const m=getActiveMuestra();
-  const keys=Object.keys(getQuotas()).filter(k=>getQuotas()[k]>0);
-  const closed=keys.filter(k=>{const[g,ag,e]=cParts(k);return getQuotas()[k]>0&&countCell(g,ag,e)>=getQuotas()[k];}).length;
+  const keys=Object.keys(APP.quotas).filter(k=>APP.quotas[k]>0);
+  const closed=keys.filter(k=>{const[g,ag,e]=cParts(k);return APP.quotas[k]>0&&countCell(g,ag,e)>=APP.quotas[k];}).length;
   const snap={
     id:Date.now(), titulo, notas, fecha:new Date().toLocaleDateString('es-AR'),
-    casos:getCases().length, jovenes:countJovenes(), n:getCurrentN(),
-    pct:getCurrentN()>0?Math.round(getCases().length/getCurrentN()*100):0,
+    casos:APP.cases.length, jovenes:countJovenes(), n:APP.n,
+    pct:APP.n>0?Math.round(APP.cases.length/APP.n*100):0,
     cerradas:closed, totalCuotas:keys.length,
-    muestra:m?.nombre||'—', cost:getSvCost(),
+    muestra:m?.nombre||'—', cost:APP.cost,
     fullState:JSON.stringify({...APP})
   };
   APP.surveys=APP.surveys||[];
@@ -2766,12 +2444,7 @@ function confirmSaveSurvey(){
 function loadSurvey(id){
   const s=APP.surveys?.find(x=>x.id===id); if(!s)return;
   if(!confirm(`¿Reactivar "${s.titulo}"? Reemplazará el estado actual.`))return;
-  try{
-    const fs = JSON.parse(s.fullState);
-    // Restaurar solo campos estructurales seguros
-    ['muestras','activeSurveys','activeMuestraId','surveys'].forEach(k=>{ if(fs[k]!==undefined) APP[k]=fs[k]; });
-    save(); renderAll(); renderEncuestas(); renderCostWidget(); goPanel('dashboard');
-  }
+  try{ Object.assign(APP,JSON.parse(s.fullState)); save(); renderAll(); renderEncuestas(); renderCostWidget(); goPanel('dashboard'); }
   catch(e){alert('Error: '+e.message);}
 }
 function deleteSurvey(id){
@@ -2818,14 +2491,8 @@ function renderEncuestas(){
 function doReset(){
   const delCases=document.getElementById('rc-casos')?.checked;
   const delMuestra=document.getElementById('rc-muestra')?.checked;
-  if(delCases){
-    const _svReset=getCurrentSurvey(); if(_svReset){ _svReset.cases=[]; _svReset._rawCases=null; _svReset.cost={}; _svReset.nextId=1; }
-    APP.nextId=1;
-  }
-  if(delMuestra){
-    APP.activeMuestraId=null;
-    const _svRM=getCurrentSurvey(); if(_svRM){ _svRM.quotas={}; _svRM.n=2500; _svRM.warnPct=80; }
-  }
+  if(delCases){APP.cases=[];APP.nextId=1;}
+  if(delMuestra){APP.activeMuestraId=null;APP.quotas={};APP.n=2500;APP.warnPct=80;}
   save(); renderAll(); renderMuestras(); closeModal('reset-modal');
 }
 
@@ -2893,11 +2560,8 @@ function populateSMMusetraSelect() {
   const sel = document.getElementById('sm-muestra-select'); if (!sel) return;
   sel.innerHTML = '<option value="">Seleccioná una muestra...</option>' +
     APP.muestras.map(m => `<option value="${m.id}">${m.nombre}</option>`).join('');
-  // Pre-seleccionar: primero la muestra de la encuesta actualmente seleccionada en el panel
-  const surveyId = document.getElementById('sm-survey-select')?.value;
-  const existingSv = (APP.activeSurveys||[]).find(sv => String(sv.smSurveyId) === String(surveyId));
-  if (existingSv?.muestraId) sel.value = existingSv.muestraId;
-  else if (APP.activeMuestraId) sel.value = APP.activeMuestraId;
+  // Pre-select active muestra
+  if (APP.activeMuestraId) sel.value = APP.activeMuestraId;
   document.getElementById('sm-muestra-card').style.display = 'block';
 }
 
@@ -2952,46 +2616,25 @@ function buildColMapUI(questions) {
   buildDeptoMapUI(questions);
 }
 
-function getSelectedMuestra(){
-  // Leer muestra del selector del panel SM, no de APP.activeMuestraId
-  const sel = document.getElementById('sm-muestra-select');
-  const mId = sel ? parseInt(sel.value) : null;
-  if(mId) return APP.muestras.find(m => m.id === mId) || null;
-  return getActiveMuestra();
-}
-
 function buildDeptoMapUI(questions) {
   const section = document.getElementById('sm-depto-section');
   const container = document.getElementById('sm-depto-map');
   if (!section || !container) return;
 
-  // ★ Usar la muestra seleccionada en el panel SM, no la activa global
-  const m = getSelectedMuestra();
+  const m = getActiveMuestra();
   let provs = [];
-  if (m && m.refTable && m.refTable.length) {
-    // Mostrar selectores de depto solo si la tabla tiene nivel1 (nacional/custom)
-    const hasNivel1 = m.refTable.some(r => r.nivel1 && r.nivel1.trim() !== '');
-    if (hasNivel1) {
-      provs = [...new Set(m.refTable.map(r => r.nivel1))].filter(x => x !== null && x !== undefined && x !== '').sort();
-    }
+  if (m && m.refTable && (m.cobertura === 'nacional' || m.cobertura === 'custom')) {
+    provs = [...new Set(m.refTable.map(r => r.nivel1))].filter(Boolean).sort();
   }
   if (!provs.length) { section.style.display = 'none'; return; }
   section.style.display = 'block';
-
-  // Pre-cargar colMap existente si la encuesta ya fue configurada
-  const surveyId = document.getElementById('sm-survey-select')?.value;
-  const existingSv = (APP.activeSurveys||[]).find(sv => String(sv.smSurveyId) === String(surveyId));
-  const existingDepto = existingSv?.colMap?.depto || {};
-
   container.innerHTML = provs.map(prov => {
     const np = norm(prov).replace(/\s/g, '').substring(0, 6);
-    // Intentar pre-seleccionar: primero del colMap guardado, luego por nombre
-    const savedQid = existingDepto[prov] || '';
-    const guessIdx = !savedQid ? questions.findIndex(q => norm(q.heading).replace(/\s/g, '').includes(np)) : -1;
-    return `<div class="field"><label style="font-size:11px">${prov}</label>
+    const guess = questions.findIndex(q => norm(q.heading).replace(/\s/g, '').includes(np));
+    return `<div class="field"><label>${prov}</label>
       <select id="smd-${prov.replace(/[^a-zA-Z0-9]/g,'_')}" data-prov="${prov}" style="width:100%">
         <option value="">(no tiene pregunta)</option>
-        ${questions.map(q => `<option value="${q.id}" ${q.id === savedQid ? 'selected' : (q === questions[guessIdx] && !savedQid ? 'selected' : '')}>${q.heading}</option>`).join('')}
+        ${questions.map(q => `<option value="${q.id}" ${q === questions[guess] ? 'selected' : ''}>${q.heading}</option>`).join('')}
       </select></div>`;
   }).join('');
 }
@@ -3078,9 +2721,9 @@ function getCurrentSurvey(){
 }
 
 // Override APP.cases / APP.quotas to always point to current survey
-function getCases(){ return getCurrentSurvey()?.cases || []; }
-function getQuotas(){ return getCurrentSurvey()?.quotas || {}; }
-function getCurrentN(){ return getCurrentSurvey()?.n || 2500; }
+function getCases(){ return getCurrentSurvey()?.cases || APP.cases || []; }
+function getQuotas(){ return getCurrentSurvey()?.quotas || APP.quotas || {}; }
+function getCurrentN(){ return getCurrentSurvey()?.n || APP.n || 2500; }
 function getCurrentMuestra(){
   const sv = getCurrentSurvey();
   const mId = sv ? sv.muestraId : APP.activeMuestraId;
@@ -3105,8 +2748,8 @@ function renderHome(){
     const pct = tgt > 0 ? Math.round(tot/tgt*100) : 0;
     const closed = keys.filter(k => { const [g,ag,e]=cParts(k); return cases.filter(c=>c.gen===g&&c.ageGrp===ag&&c.estrato===e).length >= quotas[k]; }).length;
     const jovenes = cases.filter(c=>parseInt(c.edad)<=29).length;
-    const st = pct >= 100 ? 'st-done' : pct >= getWarnPct() ? 'st-warn' : tot > 0 ? 'st-ok' : 'st-empty';
-    const bc = pct >= 100 ? 'var(--red)' : pct >= getWarnPct() ? 'var(--amber)' : 'var(--green)';
+    const st = pct >= 100 ? 'st-done' : pct >= (APP.warnPct||80) ? 'st-warn' : tot > 0 ? 'st-ok' : 'st-empty';
+    const bc = pct >= 100 ? 'var(--red)' : pct >= (APP.warnPct||80) ? 'var(--amber)' : 'var(--green)';
     const lastSync = sv.lastSync ? new Date(sv.lastSync).toLocaleString('es-AR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : 'Nunca';
 
     html += `<div class="enc-home-card ${st}" onclick="enterSurvey(${idx})">
@@ -3150,7 +2793,8 @@ function enterSurvey(idx){
   if(!sv) return;
 
   APP.activeMuestraId = sv.muestraId;
-  // n/warnPct son per-sv — no necesitan sync a APP global
+  APP.n = sv.n || 2500;
+  APP.warnPct = sv.warnPct || 80;
 
   const m = (APP.muestras||[]).find(x => x.id === sv.muestraId);
 
@@ -3170,7 +2814,8 @@ function enterSurvey(idx){
     Object.entries(m.distribution).forEach(([k,pct])=>{ sv.quotas[k]=Math.round(pct/100*sv.n); });
   }
 
-  // APP.cases/quotas/cost son proxies — apuntan a sv automáticamente al cambiar currentSurveyIdx
+  APP.cases  = sv.cases  || [];
+  APP.quotas = sv.quotas || {};
 
   const navSec   = document.getElementById('nav-encuesta-section');
   const navLabel = document.getElementById('nav-enc-label');
@@ -3179,13 +2824,14 @@ function enterSurvey(idx){
 
   goPanel('dashboard');
   renderAll();
-  renderCostWidget();  // limpia DOM y restaura presupuesto de esta encuesta específica
   populateManualProvs();
 }
 
 function volverHome(){
   APP.currentSurveyIdx = null;
-  // APP.cases/quotas son proxies — cuando currentSurveyIdx=null devuelven [] automáticamente
+  // Clear shared globals so sidebar/dashboard don't show stale data from last survey
+  APP.cases  = [];
+  APP.quotas = {};
   const navSec = document.getElementById('nav-encuesta-section');
   if(navSec) navSec.style.display = 'none';
   // Reset sidebar stats
@@ -3217,43 +2863,30 @@ function addSurveyToHome(smSurveyId, smTitle, muestraId, n, colMap, intervalMinu
     Object.entries(m.distribution).forEach(([k,pct])=>{ quotas[k] = Math.round(pct/100*(n||2500)); });
   }
 
-  const prevSv = existing >= 0 ? APP.activeSurveys[existing] : null;
   const entry = {
     smSurveyId, smTitle,
     muestraId: muestraId || null,
     n: n || 2500,
     colMap: colMap || {},
     intervalMinutes: intervalMinutes || 15,
-    cases:  prevSv ? (prevSv.cases||[])  : [],
+    cases: existing >= 0 ? (APP.activeSurveys[existing].cases||[]) : [],
     quotas,
-    lastSync:   prevSv ? prevSv.lastSync  : null,
+    lastSync: existing >= 0 ? APP.activeSurveys[existing].lastSync : null,
     syncActive: false,
-    warnPct:    prevSv ? (prevSv.warnPct||80)  : 80,
-    cost:       prevSv ? (prevSv.cost||{})     : {},  // ★ PRESERVAR costo existente
+    warnPct: APP.warnPct || 80,
   };
-
-  // Preservar _rawCases del existente
-  const prevRaw = existing >= 0 ? (APP.activeSurveys[existing]._rawCases || null) : null;
-  entry._rawCases = prevRaw;
 
   if(existing >= 0) APP.activeSurveys[existing] = entry;
   else APP.activeSurveys.push(entry);
 
-  // SIEMPRE reprocessar desde _rawCases con el nuevo colMap/muestra
-  // Esto soluciona casos donde colMap.depto se actualiza después del primer sync
-  if(m && prevRaw && prevRaw.length > 0){
-    console.log(`Reprocessing ${prevRaw.length} raw cases with updated colMap/muestra for "${smTitle}"`);
-    entry.cases = processRawCases(prevRaw, m);
-    const noEst = entry.cases.filter(c => c.estrato === '?').length;
-    console.log(`  → ${entry.cases.length - noEst} con estrato · ${noEst} sin estrato`);
-  } else if(m && entry.cases.length > 0){
-    // Fallback: reprocessar cases existentes
+  // Re-process existing raw cases with new muestra if any
+  if(m && entry.cases.length > 0 && entry.cases[0].estrato === '?'){
     entry.cases = processRawCases(entry.cases, m);
   }
 
   save();
   renderHome();
-  console.log(`Survey added/updated: ${smTitle} | Muestra: ${m?.nombre} | colMap.depto keys: ${Object.keys(colMap?.depto||{}).length} | Quotas: ${Object.keys(quotas).length}`);
+  console.log(`Survey added: ${smTitle} | Muestra: ${m?.nombre} | Quotas: ${Object.keys(quotas).length}`);
 }
 
 // ── processRawCases: assign estrato + ageGrp using muestra refTable ──
@@ -3273,30 +2906,12 @@ function processRawCases(rawCases, muestra){
   const bounds = muestra.ageBounds || parseAgeBounds(groups);
   let nextId = 1;
 
-  const isSubnacional = muestra.cobertura === 'provincial' || muestra.cobertura === 'municipal';
-
   return rawCases.map(raw => {
-    const provVal  = raw.prov  || '';
-    const deptoVal = raw.depto || '';
-
-    // lookupEst es ahora inteligente y prueba todas las combinaciones
-    const est = lookupEst(provVal, deptoVal, muestra);
+    const est = lookupEst(raw.prov, raw.depto, muestra);
     const estrato = (est !== null && est !== undefined) ? String(est) : '?';
     const ageGrp = getAgeGrp(parseInt(raw.edad), bounds, groups);
     const key = ck(raw.gen, ageGrp, estrato);
-
-    // Para encuestas subnacionales donde el depto vino como prov,
-    // normalizar: poner el valor geográfico útil en depto también
-    // para que renderProvincias lo muestre correctamente
-    const effectiveDepto = deptoVal || (isSubnacional ? provVal : '');
-
-    return {
-      ...raw,
-      depto: effectiveDepto,  // garantizar que depto tenga el valor geo más útil
-      estrato, ageGrp, key,
-      id: raw.id || `R${String(nextId++).padStart(4,'0')}`,
-      _raw: false
-    };
+    return { ...raw, estrato, ageGrp, key, id: raw.id || `R${String(nextId++).padStart(4,'0')}`, _raw: false };
   });
 }
 
@@ -3306,26 +2921,17 @@ function updateSurveyFromFirebase(data){
   if(!data || !APP.activeSurveys) return;
   if(!data.rawCases && !data.cases) { renderHome(); return; }
 
+  // The server must include surveyId so we know which survey to update.
+  // If absent (legacy), we fall back to updating only the one active survey.
   const targetId = data.surveyId ? String(data.surveyId) : null;
-  const activeSurveyIds = APP.activeSurveys.map(sv => sv.smSurveyId);
-  console.log(`[updateSurveyFromFirebase] targetId=${targetId} | rawCases=${data.rawCases?.length} | activeSurveys=[${activeSurveyIds}]`);
 
   let updatedCurrent = false;
-  let matchFound = false;
 
   APP.activeSurveys.forEach(sv => {
     // ★ CORE ISOLATION: skip surveys that don't match the incoming surveyId
-    if(targetId && String(sv.smSurveyId) !== targetId){
-      console.log(`[updateSurveyFromFirebase] SKIP sv=${sv.smSurveyId} (no coincide con targetId=${targetId})`);
-      return;
-    }
-    matchFound = true;
+    if(targetId && String(sv.smSurveyId) !== targetId) return;
 
-    if(data.lastSync){
-      sv.lastSync   = data.lastSync;
-      sv.syncStats  = data.syncStats || sv.syncStats;
-      sv.syncActive = true; // si llegaron datos, el sync está activo
-    }
+    if(data.lastSync)  sv.lastSync  = data.lastSync;
     if(data.syncStats) sv.syncStats = data.syncStats;
 
     if(data.rawCases){
@@ -3336,36 +2942,23 @@ function updateSurveyFromFirebase(data){
       sv.cases = data.cases;
     }
 
-    console.log(`[updateSurveyFromFirebase] MATCH sv=${sv.smSurveyId} → ${sv.cases?.length} casos asignados`);
     // Check if this is the currently viewed survey
     if(APP.currentSurveyIdx != null && APP.activeSurveys[APP.currentSurveyIdx] === sv){
       updatedCurrent = true;
     }
   });
 
+  // Persistir lastSync y syncStats actualizados
+  save();
+
   // Refresh currently viewed survey only if it was updated
-  // APP.cases/quotas son proxies — ya apuntan a sv automáticamente
   if(updatedCurrent && APP.currentSurveyIdx != null){
-    renderAll();
-    updateDashSyncBar();
-  }
-  if(!matchFound && targetId){
-    // Fallback: si hay exactamente UNA encuesta activa y el source es 'csv_manual',
-    // puede que el smSurveyId haya cambiado — asignar igualmente
-    const manualSv = (APP.activeSurveys||[]).find(s =>
-      !String(s.smSurveyId).startsWith('manual_') && s.colMap?.gen
-    );
-    if(manualSv && data.source === 'csv_manual'){
-      const rawCases = data.rawCases || [];
-      const muestra = (APP.muestras||[]).find(m => m.id === manualSv.muestraId);
-      manualSv.cases = muestra ? processRawCases(rawCases, muestra) : rawCases;
-      manualSv.lastSync = data.lastSync || new Date().toISOString();
-      manualSv.syncStats = data.syncStats;
-      if(APP.currentSurveyIdx != null) renderAll();
-      renderHome();
-      console.log(`[updateSurveyFromFirebase] Fallback → asignado a ${manualSv.smTitle} (${manualSv.cases.length} casos)`);
-    } else {
-      console.warn(`[updateSurveyFromFirebase] ⚠ No se encontró ninguna encuesta con smSurveyId=${targetId}. IDs activos: [${activeSurveyIds}]`);
+    const sv = APP.activeSurveys[APP.currentSurveyIdx];
+    if(sv){
+      APP.cases  = sv.cases  || [];
+      APP.quotas = sv.quotas || {};
+      renderAll();
+      updateDashSyncBar();
     }
   }
   renderHome();
@@ -3405,7 +2998,7 @@ async function startSync(){
   const surveyTitle = document.getElementById('sm-survey-select')?.options[document.getElementById('sm-survey-select').selectedIndex]?.text || surveyId;
   const muestraId = parseInt(document.getElementById('sm-muestra-select')?.value);
   const intervalMinutes = parseInt(document.getElementById('sm-interval')?.value) || 15;
-  const n = parseInt(document.getElementById('sm-n')?.value) || getCurrentSurvey()?.n || 2500;
+  const n = parseInt(document.getElementById('sm-n')?.value) || APP.n;
 
   if(!url){ alert('Ingresá la URL del servidor.'); return; }
   if(!surveyId){ alert('Seleccioná una encuesta.'); return; }
@@ -3456,10 +3049,8 @@ function goPanel(p){
   if(p==='muestras') renderMuestras();
   if(p==='encuestas') renderEncuestas();
   if(p==='sync') populateSMMusetraSelect();
-  if(p==='nueva-encuesta') neInit();
   if(p==='cargar'){
     updateCargarMuestraInfo();
-    updateUploadServerBtn();
     // Show back button if inside a survey
     const btn = document.getElementById('btn-ir-dash');
     if(btn) btn.style.display = APP.currentSurveyIdx != null ? 'inline-flex' : 'none';
@@ -3471,7 +3062,7 @@ function goPanel(p){
     // Show current case count
     const countEl = document.getElementById('cargar-casos-actuales');
     const countTxt = document.getElementById('cargar-casos-count');
-    const cur = getCases().length;
+    const cur = APP.cases?.length || 0;
     if(countEl && cur > 0){
       countEl.style.display = 'block';
       countTxt.innerHTML = `Casos cargados actualmente: <strong style="color:var(--text)">${cur}</strong> — El modo <em>Agregar</em> los conserva; el modo <em>Reemplazar</em> los borra.`;
@@ -3488,8 +3079,8 @@ function goPanel(p){
   const params = new URLSearchParams(window.location.search);
   if(params.get('view') === '1' || params.get('observer') === '1'){
     document.body.classList.add('observer-mode');
-    sessionStorage.setItem('pa','1'); // misma clave que doLogin
-    document.getElementById('login-screen').style.display='none';
+    // Skip password for observers
+    sessionStorage.setItem('pulso_auth','1');
   }
 })();
 
@@ -3540,7 +3131,7 @@ function renderSemaforo(tot, totTgt, closed, totalQuotas, cells){
 // VELOCITY + ETA
 // ══════════════════════════════════════════
 function getCasesByDay(){
-  const cases = getCases();
+  const cases = (typeof getCases==='function') ? getCases() : (APP.cases||[]);
   const byDay = {};
   cases.forEach(c => {
     if(!c.ts) return;
@@ -3552,8 +3143,8 @@ function getCasesByDay(){
 }
 
 function calcETA(){
-  const cases = getCases();
-  const quotas = getQuotas();
+  const cases = (typeof getCases==='function') ? getCases() : (APP.cases||[]);
+  const quotas = APP.quotas || {};
   const totTgt = Object.values(quotas).reduce((a,b)=>a+b,0);
   const tot = cases.length;
   if(!totTgt || tot >= totTgt) return 0;
@@ -3576,8 +3167,8 @@ function renderVelocidad(){
   const entries = Object.entries(byDay).slice(-14); // last 14 days
   const maxVal = entries.length ? Math.max(...entries.map(e=>e[1])) : 1;
   const etaDays = calcETA();
-  const cases = getCases();
-  const quotas = getQuotas();
+  const cases = (typeof getCases==='function') ? getCases() : (APP.cases||[]);
+  const quotas = APP.quotas || {};
   const totTgt = Object.values(quotas).reduce((a,b)=>a+b,0);
   const avgPerDay = entries.length > 0 ? Math.round(entries.slice(-3).reduce((s,[,v])=>s+v,0)/Math.min(3,entries.length)) : 0;
 
@@ -3625,7 +3216,7 @@ function renderVelocidad(){
 // ══════════════════════════════════════════
 function renderEstrato4(){
   const wrap = document.getElementById('e4-table-wrap'); if(!wrap) return;
-  const cases = getCases();
+  const cases = (typeof getCases==='function') ? getCases() : (APP.cases||[]);
   const search = (document.getElementById('e4-search')?.value||'').toLowerCase();
   const sortBy = document.getElementById('e4-sort')?.value || 'casos';
 
@@ -3760,15 +3351,9 @@ function updateDashSyncBar(){
   const lastSync = sv.lastSync ? new Date(sv.lastSync).toLocaleString('es-AR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : 'Nunca';
   const stats = sv.syncStats;
 
-  // Si dice activo pero nunca sincronizó, puede ser que el servidor se reinició
-  const stale = active && !sv.lastSync;
-  if(dot) dot.className = 'sync-bar-dot ' + (stale ? 'warn' : active ? 'on' : 'off');
-  if(label) label.textContent = stale
-    ? `Sync configurado, esperando primer ciclo — ${sv.smTitle||''}`
-    : active
-      ? `Sincronizando cada ${sv.intervalMinutes||15} min — ${sv.smTitle||''}`
-      : `Sync detenido — ${sv.smTitle||''}`;
-  if(meta) meta.textContent = `Último sync: ${lastSync}` + (stats ? ` · ${stats.valid} válidos · ${stats.excluded||0} excluidos` : '');
+  if(dot) dot.className = 'sync-bar-dot ' + (active ? 'on' : 'off');
+  if(label) label.textContent = active ? `Sincronizando cada ${sv.intervalMinutes||15} min — ${sv.smTitle||''}` : `Sync detenido — ${sv.smTitle||''}`;
+  if(meta) meta.textContent = `Último sync: ${lastSync}` + (stats ? ` · ${stats.valid} válidos · ${stats.excluded} excluidos` : '');
   if(intervalInp && !active) intervalInp.value = sv.intervalMinutes || 15;
   if(startBtn) startBtn.style.display = active ? 'none' : '';
   if(stopBtn) stopBtn.style.display = active ? '' : 'none';
@@ -3800,18 +3385,15 @@ async function dashSyncStart(){
     });
     const data = await r.json();
     if(data.ok){
+      // Update survey entry
       const idx = APP.currentSurveyIdx;
       if(idx != null && APP.activeSurveys[idx]){
-        APP.activeSurveys[idx].syncActive      = true;
+        APP.activeSurveys[idx].syncActive = true;
         APP.activeSurveys[idx].intervalMinutes = intervalMinutes;
-        // No resetear lastSync — conservar el del sync anterior si existe
       }
-      _syncReregistered = false; // permitir re-registro en próxima recarga
       save();
       updateDashSyncBar();
       renderHome();
-      // Forzar sync inmediato para confirmar que el servidor responde
-      setTimeout(dashSyncNow, 1500);
     } else { throw new Error(data.error); }
   } catch(e){
     alert('Error al iniciar sync: ' + e.message);
@@ -3828,7 +3410,6 @@ async function dashSyncStop(){
     if(idx != null && APP.activeSurveys[idx]){
       APP.activeSurveys[idx].syncActive = false;
     }
-    _syncReregistered = false;
     save();
     updateDashSyncBar();
     renderHome();
@@ -3946,456 +3527,27 @@ function renderEstrato4(){
   content.innerHTML = html || `<div class="empty-state"><div class="empty-sub">Sin resultados para "${search}"</div></div>`;
 }
 
-
 // ══════════════════════════════════════════
-// MÓDULO: NUEVA ENCUESTA MANUAL
-// ══════════════════════════════════════════
-let _neQuestions = [];
-let _neSMSurveys = [];
-
-function neInit(){
-  // Poblar selector de muestras
-  const sel = document.getElementById('ne-muestra');
-  if(!sel) return;
-  sel.innerHTML = '<option value="">— Seleccioná muestra —</option>' +
-    (APP.muestras||[]).map(m => `<option value="${m.id}">${m.nombre}</option>`).join('');
-  // Info de muestra al cambiar
-  sel.onchange = () => neUpdateMuestraInfo();
-  // Cargar encuestas SM si hay servidor
-  neLoadSMSurveys();
-  // Renderizar lista de existentes
-  neRenderExistentes();
-}
-
-function neUpdateMuestraInfo(){
-  const mId = parseInt(document.getElementById('ne-muestra')?.value);
-  const m = (APP.muestras||[]).find(x => x.id === mId);
-  const el = document.getElementById('ne-muestra-info');
-  if(!el) return;
-  if(!m){ el.innerHTML = ''; return; }
-  const cobLabels = {nacional:'Nacional',provincial:'Provincial',municipal:'Municipal',custom:'Personalizada'};
-  const estratos = [...new Set((m.refTable||[]).map(r=>r.estrato).filter(x => x !== null && x !== undefined && x !== ''))];
-  el.innerHTML = `<div class="al al-g" style="font-size:12px">
-    ✓ <strong>${m.nombre}</strong> · ${cobLabels[m.cobertura]||m.cobertura} · ${estratos.length} estratos · ${m.ageGroups?.join(', ')||'—'}
-  </div>`;
-  // Si hay SM survey seleccionado, rebuild depto map
-  if(_neQuestions.length) neRebuildDeptoMap();
-}
-
-async function neLoadSMSurveys(){
-  const url = _smServerUrl;
-  if(!url) return;
-  try {
-    const r = await fetch(`${url}/surveys`);
-    const data = await r.json();
-    _neSMSurveys = data.surveys || [];
-    const sel = document.getElementById('ne-sm-survey');
-    if(!sel) return;
-    sel.innerHTML = '<option value="">— Seleccioná encuesta —</option>' +
-      _neSMSurveys.map(s => `<option value="${s.id}" data-count="${s.response_count}">${s.title} (${s.response_count} resp.)</option>`).join('');
-  } catch(e){ console.log('No se pudo cargar surveys SM:', e.message); }
-}
-
-function neToggleSM(){
-  const on = document.getElementById('ne-use-sm')?.checked;
-  document.getElementById('ne-sm-fields').style.display = on ? 'block' : 'none';
-  if(on && _neSMSurveys.length === 0) neLoadSMSurveys();
-}
-
-async function neOnSMSurveySelect(){
-  const surveyId = document.getElementById('ne-sm-survey')?.value;
-  const sel = document.getElementById('ne-sm-survey');
-  const meta = document.getElementById('ne-sm-survey-meta');
-  if(!surveyId){ 
-    document.getElementById('ne-colmap-wrap').style.display = 'none';
-    return; 
-  }
-  const opt = sel?.options[sel.selectedIndex];
-  if(meta) meta.textContent = `ID: ${surveyId} · ${opt?.dataset.count||0} respuestas`;
-  
-  // Si el nombre de la encuesta está vacío, pre-llenarlo
-  const nameEl = document.getElementById('ne-nombre');
-  if(nameEl && !nameEl.value && opt?.text){
-    nameEl.value = opt.text.split('(')[0].trim();
-  }
-
-  // Cargar preguntas
-  const url = _smServerUrl; if(!url) return;
-  try {
-    const r = await fetch(`${url}/surveys/${surveyId}/questions`);
-    const data = await r.json();
-    if(data.error) throw new Error(data.error);
-    _neQuestions = data.questions || [];
-    neBuildColMap(_neQuestions);
-    document.getElementById('ne-colmap-wrap').style.display = 'block';
-  } catch(e){ 
-    if(meta) meta.textContent += ' · Error cargando preguntas: ' + e.message;
-  }
-}
-
-function neBuildColMap(questions){
-  const container = document.getElementById('ne-colmap-fields'); 
-  if(!container) return;
-  const mkSel = (id, label, kws) => {
-    const guess = questions.findIndex(q => kws.some(k => norm(q.heading).includes(k)));
-    return `<div class="field"><label style="font-size:11px">${label}</label>
-      <select id="${id}" style="width:100%">
-        <option value="">(ninguna)</option>
-        ${questions.map(q => `<option value="${q.id}" ${q===questions[guess]?'selected':''}>${q.heading}</option>`).join('')}
-      </select></div>`;
-  };
-  container.innerHTML =
-    mkSel('ne-smc-gen',  'Género / Sexo',       ['genero','género','sexo','gender']) +
-    mkSel('ne-smc-edad', 'Edad',                 ['edad','age','años']) +
-    mkSel('ne-smc-prov', 'Provincia / Depto',    ['provincia','province','prov','departamento','depto','region','región']) +
-    mkSel('ne-smc-id',   'ID caso (opcional)',   ['id','respondent']);
-
-  // Filter col
-  const fSel = document.getElementById('ne-filter-col');
-  if(fSel){
-    fSel.innerHTML = '<option value="">(no filtrar)</option>' +
-      questions.map(q => `<option value="${q.id}">${q.heading}</option>`).join('');
-    const fGuess = questions.findIndex(q => ['candidatos','espacio','vot','legislativ'].some(k => norm(q.heading).includes(k)));
-    if(fGuess >= 0) fSel.value = questions[fGuess].id;
-  }
-  neRebuildDeptoMap();
-}
-
-function neRebuildDeptoMap(){
-  const section   = document.getElementById('ne-depto-section');
-  const container = document.getElementById('ne-depto-map');
-  if(!section || !container) return;
-  const mId = parseInt(document.getElementById('ne-muestra')?.value);
-  const m = (APP.muestras||[]).find(x => x.id === mId);
-  if(!m || !m.refTable) { section.style.display='none'; return; }
-  const hasNivel1 = m.refTable.some(r => r.nivel1 && r.nivel1.trim() !== '');
-  if(!hasNivel1) { section.style.display='none'; return; }
-  const provs = [...new Set(m.refTable.map(r => r.nivel1))].filter(x => x !== null && x !== undefined && x !== '').sort();
-  if(!provs.length) { section.style.display='none'; return; }
-  section.style.display = 'block';
-  const questions = _neQuestions;
-  container.innerHTML = provs.map(prov => {
-    const np = norm(prov).replace(/\s/g,'').substring(0,6);
-    const guess = questions.findIndex(q => norm(q.heading).replace(/\s/g,'').includes(np));
-    return `<div class="field"><label style="font-size:10px">${prov}</label>
-      <select id="ned-${prov.replace(/[^a-zA-Z0-9]/g,'_')}" data-prov="${prov}" style="width:100%;font-size:11px">
-        <option value="">(no tiene)</option>
-        ${questions.map(q => `<option value="${q.id}" ${q===questions[guess]?'selected':''}>${q.heading}</option>`).join('')}
-      </select></div>`;
-  }).join('');
-}
-
-function neGetColMap(){
-  const colMap = {
-    gen:       document.getElementById('ne-smc-gen')?.value  || '',
-    edad:      document.getElementById('ne-smc-edad')?.value || '',
-    prov:      document.getElementById('ne-smc-prov')?.value || '',
-    idCol:     document.getElementById('ne-smc-id')?.value   || '',
-    filterCol: document.getElementById('ne-filter-col')?.value || '',
-    filterVal: document.getElementById('ne-filter-val')?.value || 'not answered',
-    depto: {},
-  };
-  document.querySelectorAll('#ne-depto-map [data-prov]').forEach(sel => {
-    if(sel.value) colMap.depto[sel.dataset.prov] = sel.value;
-  });
-  return colMap;
-}
-
-async function neCrear(){
-  const nombre = document.getElementById('ne-nombre')?.value?.trim();
-  const n      = parseInt(document.getElementById('ne-n')?.value) || 0;
-  const mId    = parseInt(document.getElementById('ne-muestra')?.value) || null;
-  const moneda = document.getElementById('ne-moneda')?.value || '$';
-  const useSM  = document.getElementById('ne-use-sm')?.checked;
-  const msg    = document.getElementById('ne-msg');
-
-  if(!nombre){ if(msg) msg.textContent = '⚠ Nombre requerido'; return; }
-  if(!n)     { if(msg) msg.textContent = '⚠ N objetivo requerido'; return; }
-
-  if(useSM){
-    // Con SM: usar flujo existente addSurveyToHome + startSync
-    const surveyId = document.getElementById('ne-sm-survey')?.value;
-    if(!surveyId){ if(msg) msg.textContent = '⚠ Seleccioná una encuesta SM'; return; }
-    const colMap      = neGetColMap();
-    const interval    = parseInt(document.getElementById('ne-interval')?.value) || 15;
-
-    if(!colMap.gen || !colMap.edad || !colMap.prov){
-      if(msg) msg.textContent = '⚠ Mapeá al menos Género, Edad y Provincia';
-      return;
-    }
-
-    // Agregar al home
-    addSurveyToHome(surveyId, nombre, mId, n, colMap, interval);
-
-    // Iniciar sync en servidor
-    const url = _smServerUrl;
-    if(url){
-      try {
-        await fetch(`${url}/sync/config`, {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ surveyId, colMap, muestraId: mId, intervalMinutes: interval })
-        });
-        if(msg){ msg.style.color='var(--green)'; msg.textContent = `✓ Encuesta "${nombre}" creada y sync iniciado`; }
-      } catch(e){
-        addSurveyToHome(surveyId, nombre, mId, n, colMap, interval);
-        if(msg){ msg.style.color='var(--amber)'; msg.textContent = `✓ Creada (sync pendiente — servidor no disponible)`; }
-      }
-    } else {
-      if(msg){ msg.style.color='var(--amber)'; msg.textContent = `✓ Creada sin sync (configurá el servidor en SurveyMonkey)`; }
-    }
-  } else {
-    // Sin SM: crear encuesta manual vacía, listo para cargar CSV
-    const fakeId = 'manual_' + Date.now();
-    addSurveyToHome(fakeId, nombre, mId, n, {gen:'',edad:'',prov:'',depto:{},filterCol:'',filterVal:'not answered'}, 0);
-    // Guardar moneda
-    const sv = (APP.activeSurveys||[]).find(s => s.smSurveyId === fakeId);
-    if(sv) sv.cost = { moneda };
-    save();
-    if(msg){ msg.style.color='var(--green)'; msg.textContent = `✓ Encuesta "${nombre}" creada — cargá datos vía CSV`; }
-  }
-
-  save();
-  neRenderExistentes();
-  setTimeout(() => { if(msg) msg.textContent = ''; }, 4000);
-}
-
-function neReset(){
-  ['ne-nombre','ne-n','ne-interval'].forEach(id => { const el=document.getElementById(id); if(el) el.value=''; });
-  document.getElementById('ne-muestra').value = '';
-  document.getElementById('ne-use-sm').checked = false;
-  document.getElementById('ne-sm-fields').style.display = 'none';
-  document.getElementById('ne-colmap-wrap').style.display = 'none';
-  document.getElementById('ne-muestra-info').innerHTML = '';
-  _neQuestions = [];
-}
-
-function neRenderExistentes(){
-  const container = document.getElementById('ne-existentes-list');
-  if(!container) return;
-  const surveys = APP.activeSurveys || [];
-  if(!surveys.length){ container.innerHTML = '<div style="color:var(--muted);font-size:12px">No hay encuestas activas.</div>'; return; }
-  
-  container.innerHTML = surveys.map((sv, idx) => {
-    const m = (APP.muestras||[]).find(x => x.id === sv.muestraId);
-    const isManual = String(sv.smSurveyId).startsWith('manual_');
-    const isConnected = !isManual && sv.syncActive;
-    const badgeColor = isConnected ? 'var(--green)' : isManual ? 'var(--amber)' : 'var(--muted)';
-    const badgeText  = isConnected ? '● Sync activo' : isManual ? '○ Manual' : '○ Sin sync';
-    return `<div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)">
-      <div style="flex:1">
-        <div style="font-weight:600;font-size:13px">${sv.smTitle}</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:2px">
-          ${m?.nombre||'Sin muestra'} · N=${(sv.n||0).toLocaleString('es-AR')} · 
-          <span style="font-family:var(--mono);color:var(--muted2)">${isManual ? 'ID manual' : 'SM: '+sv.smSurveyId}</span>
-        </div>
-      </div>
-      <span style="font-size:10px;color:${badgeColor};font-family:var(--mono)">${badgeText}</span>
-      ${isManual ? `<button class="btn btn-w" style="font-size:11px;padding:4px 10px" onclick="neConectarSM(${idx})">Conectar SM</button>` : ''}
-    </div>`;
-  }).join('');
-}
-
-async function neConectarSM(idx){
-  const sv = (APP.activeSurveys||[])[idx];
-  if(!sv) return;
-  
-  // Mostrar modal inline para ingresar surveyId
-  const surveyId = prompt(`ID de la encuesta en SurveyMonkey para "${sv.smTitle}":
-(lo encontrás en la URL de SM o en la lista de arriba)`);
-  if(!surveyId) return;
-
-  // Cargar preguntas y mostrar colmap
-  const url = _smServerUrl;
-  if(!url){ alert('Configurá el servidor en SurveyMonkey primero.'); return; }
-  
-  try {
-    const r = await fetch(`${url}/surveys/${surveyId}/questions`);
-    const data = await r.json();
-    if(data.error) throw new Error(data.error);
-    
-    // Actualizar smSurveyId
-    const oldId = sv.smSurveyId;
-    sv.smSurveyId = surveyId;
-    
-    // Ir al panel SM con esta encuesta pre-seleccionada para configurar colMap
-    goPanel('sync');
-    setTimeout(() => {
-      const smSel = document.getElementById('sm-survey-select');
-      if(smSel){ smSel.value = surveyId; }
-      // Recargar encuestas SM para que aparezca en el listado
-      alert(`Encuesta actualizada a SM ID: ${surveyId}\n\nAhora configurá el mapeo de columnas y hacé clic en "Iniciar sync".`);
-    }, 300);
-    
-    save();
-  } catch(e){
-    alert('Error: ' + e.message);
-  }
-}
-
-// Inicializar al abrir el panel
-
-
-// ══════════════════════════════════════════
-// CSV → SERVER UPLOAD
-// Permite enviar un CSV manual al servidor Railway para que lo
-// procese y lo suba a Firebase (mismo flujo que el sync automático)
-// ══════════════════════════════════════════
-async function uploadCsvToServer(){
-  const sv = getCurrentSurvey();
-  if(!sv){ alert('Entrá a una encuesta primero.'); return; }
-  if(!_svRows || _svRows.length < 2){ alert('Cargá un CSV primero.'); return; }
-  const url = _smServerUrl || localStorage.getItem('pulso_sync_url');
-  if(!url){ alert('Configurá el servidor Railway en la pestaña SurveyMonkey.'); return; }
-
-  const btn = document.getElementById('btn-upload-server');
-  if(btn){ btn.textContent = '⬆ Subiendo...'; btn.disabled = true; }
-
-  try {
-    // Convertir _svRows a CSV string
-    const csvContent = _svRows.map(row =>
-      row.map(cell => {
-        const s = String(cell||'');
-        return s.includes(',') || s.includes('"') || s.includes('\n')
-          ? '"' + s.replace(/"/g,'""') + '"' : s;
-      }).join(',')
-    ).join('\n');
-
-    const r = await fetch(`${url}/csv/upload`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        surveyId: sv.smSurveyId,
-        csvContent,
-        colMap: sv.colMap || {},
-      }),
-    });
-    const data = await r.json();
-    if(data.ok){
-      const msgEl = document.getElementById('sv-proc-msg');
-      if(msgEl) msgEl.innerHTML = `<span style="color:var(--green)">✓ Subido al servidor: ${data.valid} casos válidos de ${data.total} filas. Firebase actualizado.</span>`;
-    } else {
-      alert('Error del servidor: ' + (data.error || 'desconocido'));
-    }
-  } catch(e){
-    alert('Error de red: ' + e.message);
-  } finally {
-    if(btn){ btn.textContent = '⬆ Subir al servidor'; btn.disabled = false; }
-  }
-}
-
-// Mostrar/ocultar botón de subida según si hay sync configurado
-function updateUploadServerBtn(){
-  const btn = document.getElementById('btn-upload-server');
-  if(!btn) return;
-  const sv = getCurrentSurvey();
-  const url = _smServerUrl || localStorage.getItem('pulso_sync_url');
-  const isManual = !sv || String(sv.smSurveyId).startsWith('manual_');
-  btn.style.display = (sv && url && !isManual) ? 'inline-flex' : 'none';
-}
-
-// ══════════════════════════════════════════
-// ══════════════════════════════════════════
-// LOADING OVERLAY MANAGER
-// ══════════════════════════════════════════
-
-// ══════════════════════════════════════════
-// AUTO-REREGISTER SYNCS EN RAILWAY
-// Cuando Firebase restaura la config al cargar, re-registra
-// en Railway todas las encuestas activas para que el cron
-// no se pierda tras un reinicio del servidor.
-// ══════════════════════════════════════════
-let _syncReregistered = false; // solo hacerlo una vez por sesión
-
-async function reRegisterActiveSyncs(){
-  if(_syncReregistered) return;
-  const url = _smServerUrl;
-  if(!url) return;
-
-  const activas = (APP.activeSurveys||[]).filter(sv =>
-    sv.syncActive &&
-    sv.smSurveyId &&
-    !String(sv.smSurveyId).startsWith('manual_') &&
-    sv.colMap?.gen
-  );
-
-  if(!activas.length) return;
-
-  console.log(`[AutoSync] Re-registrando ${activas.length} encuesta(s) en Railway...`);
-
-  // Verificar que Railway está respondiendo antes de registrar
-  try {
-    const health = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    if(!health.ok) { console.warn('[AutoSync] Railway no responde'); return; }
-  } catch(e) {
-    console.warn('[AutoSync] Railway inaccesible:', e.message);
-    return;
-  }
-
-  for(const sv of activas){
-    try {
-      const r = await fetch(`${url}/sync/config`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          surveyId:        sv.smSurveyId,
-          colMap:          sv.colMap,
-          muestraId:       sv.muestraId,
-          intervalMinutes: sv.intervalMinutes || 720,
-        }),
-      });
-      const data = await r.json();
-      if(data.ok){
-        console.log(`[AutoSync] ✓ ${sv.smTitle} re-registrada (cada ${sv.intervalMinutes||720} min)`);
-      } else {
-        console.warn(`[AutoSync] ✗ ${sv.smTitle}:`, data.error);
-      }
-    } catch(e){
-      console.warn(`[AutoSync] Error re-registrando ${sv.smTitle}:`, e.message);
-    }
-  }
-
-  _syncReregistered = true;
-}
-
-let _fbLoadingHidden = false;
-function _fbHideLoading(msg){
-  if(_fbLoadingHidden) return;
-  _fbLoadingHidden = true;
-  const ov = document.getElementById('fb-loading');
-  if(!ov) return;
-  ov.style.opacity = '0';
-  setTimeout(() => { ov.style.display = 'none'; }, 420);
-  if(msg) console.log('[FB]', msg);
-}
-
 // INIT
 // ══════════════════════════════════════════
 load();
 if(!APP.activeSurveys) APP.activeSurveys = [];
 if(!APP.surveys) APP.surveys = [];
-// APP.cases/quotas/cost/n/warnPct son proxies que apuntan a la survey activa
-// No necesitan limpiarse — cuando currentSurveyIdx=null devuelven defaults automáticamente
+// Always start with clean global state — survey data lives in activeSurveys[].cases
+// APP.cases is only a "working copy" populated when entering a specific survey
+APP.cases  = [];
+APP.quotas = {};
 APP.currentSurveyIdx = null;
 // Observer mode via URL param
 (function(){
   const p=new URLSearchParams(window.location.search);
   if(p.get('view')==='1'||p.get('observer')==='1'){
     document.body.classList.add('observer-mode');
-    sessionStorage.setItem('pa','1');
-    document.getElementById('login-screen').style.display='none';
+    sessionStorage.setItem('pulso_auth','1');
   }
 })();
-// Si Firebase no responde en 3 segundos, mostrar lo que haya (localStorage o vacío)
-setTimeout(() => {
-  if(!_fbLoadingHidden){
-    _fbHideLoading('timeout — usando datos locales');
-    renderHome();
-    renderMuestras();
-  }
-}, 3000);
-
-// Firebase onValue va a renderizar cuando lleguen los datos reales
-// Mientras tanto, un F5 normal muestra el loading overlay
+renderHome();
+renderMuestras();
 renderEncuestas();
 renderCostWidget();
 updateCargarMuestraInfo();
@@ -4404,42 +3556,6 @@ populateManualProvs();
 (function(){
   const el=document.getElementById('sm-server-url');
   if(el) el.value=_smServerUrl;
-})();
-</script>
-
-<!-- ══ AUTO-RELOAD: detecta nueva versión en GitHub Pages ══ -->
-<script>
-(function(){
-  const CURRENT_VERSION = '97107514';
-  const CHECK_INTERVAL  = 5 * 60 * 1000; // cada 5 minutos
-
-  async function checkVersion(){
-    try {
-      // Fetch el HTML con cache-bust para ver si cambió
-      const url = window.location.href.split('?')[0] + '?_v=' + Date.now();
-      const res  = await fetch(url, { cache: 'no-store' });
-      const text = await res.text();
-      // Buscar el token de versión en el HTML descargado
-      const match = text.match(/CURRENT_VERSION = '([a-f0-9]+)'/);
-      if(match && match[1] !== CURRENT_VERSION){
-        console.log('[AutoReload] Nueva versión detectada:', match[1], '→ recargando...');
-        // Mostrar aviso suave antes de recargar
-        const banner = document.createElement('div');
-        banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#3ecf8e;color:#000;text-align:center;padding:10px;font-weight:600;font-size:13px;cursor:pointer';
-        banner.textContent = '🔄 Nueva versión disponible — recargando...';
-        banner.onclick = () => location.reload(true);
-        document.body.appendChild(banner);
-        setTimeout(() => location.reload(true), 2000);
-      }
-    } catch(e){
-      // silencioso — no interrumpir si falla
-    }
-  }
-
-  // Primera verificación a los 30 segundos de cargar
-  setTimeout(checkVersion, 30000);
-  // Luego cada 5 minutos
-  setInterval(checkVersion, CHECK_INTERVAL);
 })();
 </script>
 </body>
