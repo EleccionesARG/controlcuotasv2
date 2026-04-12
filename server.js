@@ -16,7 +16,7 @@ const express = require('express');
 const cors    = require('cors');
 const axios   = require('axios');
 const { initializeApp }   = require('firebase/app');
-const { getDatabase, ref, set } = require('firebase/database');
+const { getDatabase, ref, set, get } = require('firebase/database');
 
 // ──────────────────────────────────────────
 // CONFIG — variables de entorno en Railway
@@ -37,6 +37,54 @@ try {
   console.log('[firebase] Conectado a', FB_DB_URL);
 } catch (e) {
   console.error('[firebase] Error al inicializar:', e.message);
+}
+
+// ──────────────────────────────────────────
+// SYNC CONFIG PERSISTENCE — sobrevive reinicios de Railway
+// ──────────────────────────────────────────
+const CONFIG_FB_PATH = 'pulso/syncServerConfig';
+
+async function saveSyncConfigToFirebase(cfg) {
+  if (!fbReady) return;
+  try {
+    await set(ref(db, CONFIG_FB_PATH), JSON.stringify(cfg));
+    console.log('[config] Guardado en Firebase');
+  } catch (e) {
+    console.error('[config] Error guardando:', e.message);
+  }
+}
+
+async function restoreSyncConfigFromFirebase() {
+  if (!fbReady) return;
+  try {
+    const snap = await get(ref(db, CONFIG_FB_PATH));
+    const raw = snap.val();
+    if (!raw) { console.log('[config] Sin config guardada'); return; }
+    const cfg = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!cfg.surveyId || !cfg.colMap) return;
+
+    syncConfig = {
+      surveyId:        String(cfg.surveyId),
+      colMap:          cfg.colMap,
+      muestraId:       cfg.muestraId,
+      intervalMinutes: Math.max(5, parseInt(cfg.intervalMinutes) || 15),
+    };
+
+    // Reiniciar timer
+    if (syncTimer) clearInterval(syncTimer);
+    syncActive = true;
+    const ms = syncConfig.intervalMinutes * 60 * 1000;
+    syncTimer = setInterval(() => {
+      runSync().catch(e => console.error('[sync timer]', e.message));
+    }, ms);
+
+    console.log(`[config] Restaurado desde Firebase: survey ${syncConfig.surveyId}, cada ${syncConfig.intervalMinutes} min`);
+
+    // Sync inmediato al restaurar
+    runSync().catch(e => console.error('[config restore → runSync]', e.message));
+  } catch (e) {
+    console.error('[config] Error restaurando:', e.message);
+  }
 }
 
 // ──────────────────────────────────────────
@@ -362,6 +410,9 @@ app.post('/sync/config', async (req, res) => {
     runSync().catch(e => console.error('[sync timer]', e.message));
   }, ms);
 
+  // Persistir config para sobrevivir reinicios
+  await saveSyncConfigToFirebase(syncConfig);
+
   console.log(`[sync/config] Configurado: survey ${surveyId}, cada ${syncConfig.intervalMinutes} min`);
   res.json({
     ok:      true,
@@ -391,8 +442,10 @@ app.post('/sync/stop', (req, res) => {
 // ──────────────────────────────────────────
 // START
 // ──────────────────────────────────────────
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`\n  Pulso Sync Server — puerto ${PORT}`);
   console.log(`  SM Token:  ${SM_TOKEN ? '✓ configurado' : '✗ FALTA SM_TOKEN'}`);
   console.log(`  Firebase:  ${fbReady ? '✓ conectado' : '✗ no disponible'}\n`);
+  // Restaurar config guardada (sobrevive reinicios de Railway)
+  await restoreSyncConfigFromFirebase();
 });
