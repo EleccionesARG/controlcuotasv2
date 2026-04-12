@@ -2661,18 +2661,15 @@ async function syncNow() {
   const url = getSyncServerUrl() || _smServerUrl;
   if (!url) { alert('Configurá el servidor primero.'); return; }
   const msgEl = document.getElementById('sm-sync-msg');
-  if (msgEl) { msgEl.textContent = '⟳ Sincronizando...'; msgEl.style.color = 'var(--amber)'; }
-  try {
-    const r = await fetch(`${url}/sync/now`, { method: 'POST' });
-    const data = await r.json();
-    if (data.ok) {
-      if (msgEl) { msgEl.textContent = '✓ Sincronización completada'; msgEl.style.color = 'var(--green)'; }
-    } else {
-      throw new Error(data.error);
+  if (msgEl) { msgEl.textContent = '⟳ Sincronizando... (puede tardar hasta 60s)'; msgEl.style.color = 'var(--amber)'; }
+  // Fire and forget — Firebase actualizará la UI cuando el servidor termine
+  fetch(`${url}/sync/now`, { method: 'POST' }).catch(() => {});
+  setTimeout(() => {
+    if (msgEl && msgEl.textContent.includes('Sincronizando')) {
+      msgEl.textContent = '✓ Sync iniciado — esperando datos de Firebase...';
+      msgEl.style.color = 'var(--green)';
     }
-  } catch(e) {
-    if (msgEl) { msgEl.textContent = `✗ ${e.message}`; msgEl.style.color = 'var(--red)'; }
-  }
+  }, 3000);
 }
 
 async function stopSync() {
@@ -2940,9 +2937,6 @@ function updateSurveyFromFirebase(data){
     // ★ CORE ISOLATION: skip surveys that don't match the incoming surveyId
     if(targetId && String(sv.smSurveyId) !== targetId) return;
 
-    if(data.lastSync)  sv.lastSync  = data.lastSync;
-    if(data.syncStats) sv.syncStats = data.syncStats;
-
     if(data.rawCases){
       sv._rawCases = data.rawCases; // store originals per-survey
       const muestra = (APP.muestras||[]).find(m => m.id === sv.muestraId);
@@ -2956,12 +2950,6 @@ function updateSurveyFromFirebase(data){
       updatedCurrent = true;
     }
   });
-
-  // Persistir timestamps en Firebase para que todos los dispositivos los vean
-  // Usamos un path separado para no interferir con v4sync ni activar _suppressRemote
-  if(window._fbSet && window._fbSyncRef) {
-    // No hacemos nada extra: v4sync ya tiene lastSync y todos lo leen via onValue
-  }
 
   // Refresh currently viewed survey only if it was updated
   if(updatedCurrent && APP.currentSurveyIdx != null){
@@ -2980,13 +2968,10 @@ async function syncNowAll(){
   const url = _smServerUrl || localStorage.getItem('pulso_sync_url');
   if(!url){ alert('Configurá el servidor en la pestaña SurveyMonkey primero.'); return; }
   const btn = event.target; btn.textContent = '⟳ Actualizando...'; btn.disabled = true;
-  try {
-    await fetch(`${url}/sync/now`, { method: 'POST' });
-    btn.textContent = '✓ Actualizado';
-    setTimeout(()=>{ btn.textContent='⟳ Actualizar todo'; btn.disabled=false; }, 2000);
-  } catch(e){
-    btn.textContent = '✗ Error'; btn.disabled = false;
-  }
+  // Fire and forget — el sync tarda >30s, Firebase notifica cuando termina
+  fetch(`${url}/sync/now`, { method: 'POST' }).catch(() => {});
+  // Restaurar botón después de 3 segundos (Firebase actualizará la UI solo)
+  setTimeout(()=>{ btn.textContent='⟳ Actualizar todo'; btn.disabled=false; }, 3000);
 }
 
 // ══════════════════════════════════════════
