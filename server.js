@@ -45,29 +45,29 @@ try {
 const CONFIG_FB_PATH = 'pulso/syncServerConfig';
 
 async function saveSyncConfigToFirebase(cfg) {
-  if (!fbReady) return;
-  try {
-    await set(ref(db, CONFIG_FB_PATH), JSON.stringify(cfg));
-    console.log('[config] Guardado en Firebase');
-  } catch (e) {
-    console.error('[config] Error guardando:', e.message);
-  }
+  // No necesitamos guardar en un path separado —
+  // la config vive en pulso/v4config (escrita por el dashboard)
 }
 
 async function restoreSyncConfigFromFirebase() {
   if (!fbReady) return;
   try {
-    const snap = await get(ref(db, CONFIG_FB_PATH));
+    // Leer desde pulso/v4config — ya tiene permisos y contiene activeSurveys con colMap
+    const snap = await get(ref(db, 'pulso/v4config'));
     const raw = snap.val();
-    if (!raw) { console.log('[config] Sin config guardada'); return; }
+    if (!raw) { console.log('[config] Sin config en Firebase'); return; }
     const cfg = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    if (!cfg.surveyId || !cfg.colMap) return;
+
+    // Buscar la primera encuesta activa con colMap configurado
+    const surveys = cfg.activeSurveys || [];
+    const sv = surveys.find(s => s.smSurveyId && s.colMap && s.colMap.gen);
+    if (!sv) { console.log('[config] Sin encuesta activa con colMap'); return; }
 
     syncConfig = {
-      surveyId:        String(cfg.surveyId),
-      colMap:          cfg.colMap,
-      muestraId:       cfg.muestraId,
-      intervalMinutes: Math.max(5, parseInt(cfg.intervalMinutes) || 15),
+      surveyId:        String(sv.smSurveyId),
+      colMap:          sv.colMap,
+      muestraId:       sv.muestraId,
+      intervalMinutes: Math.max(5, parseInt(sv.intervalMinutes) || 15),
     };
 
     // Reiniciar timer
@@ -78,7 +78,7 @@ async function restoreSyncConfigFromFirebase() {
       runSync().catch(e => console.error('[sync timer]', e.message));
     }, ms);
 
-    console.log(`[config] Restaurado desde Firebase: survey ${syncConfig.surveyId}, cada ${syncConfig.intervalMinutes} min`);
+    console.log(`[config] Restaurado desde v4config: survey ${syncConfig.surveyId}, cada ${syncConfig.intervalMinutes} min`);
 
     // Sync inmediato al restaurar
     runSync().catch(e => console.error('[config restore → runSync]', e.message));
@@ -409,9 +409,6 @@ app.post('/sync/config', async (req, res) => {
   syncTimer = setInterval(() => {
     runSync().catch(e => console.error('[sync timer]', e.message));
   }, ms);
-
-  // Persistir config para sobrevivir reinicios
-  await saveSyncConfigToFirebase(syncConfig);
 
   console.log(`[sync/config] Configurado: survey ${surveyId}, cada ${syncConfig.intervalMinutes} min`);
   res.json({
