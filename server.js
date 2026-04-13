@@ -417,15 +417,13 @@ app.post('/sync/config', async (req, res) => {
   });
 });
 
-// POST /sync/now — fuerza sync inmediato
-app.post('/sync/now', async (req, res) => {
+// POST /sync/now — fuerza sync inmediato (fire and forget)
+app.post('/sync/now', (req, res) => {
   if (!syncConfig) return res.json({ ok: false, error: 'Sin configuración. Usá /sync/config primero.' });
-  try {
-    await runSync();
-    res.json({ ok: true, lastSync: lastSyncTime });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
+  // Responder inmediatamente — no esperar que termine el sync
+  res.json({ ok: true, message: 'Sync iniciado' });
+  // Correr el sync en background
+  runSync().catch(e => console.error('[sync/now]', e.message));
 });
 
 // POST /sync/stop — detiene polling
