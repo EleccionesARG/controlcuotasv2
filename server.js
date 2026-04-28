@@ -1,13 +1,16 @@
 /**
- * pulso-sync — Railway backend for Control de Cuotas Pulso
- * Endpoints consumidos por control_cuotas_pulso_v4.html
+ * pulso-sync — Railway backend para Control de Cuotas Pulso
+ * MULTI-SURVEY: cada encuesta tiene su propio timer e interval.
  *
- * GET  /                         → health check
- * GET  /surveys                  → lista de encuestas SM
- * GET  /surveys/:id/questions    → preguntas de la encuesta
- * POST /sync/config              → configura y arranca polling
- * POST /sync/now                 → sync inmediato
- * POST /sync/stop                → detiene polling
+ * Endpoints:
+ *  GET  /                       → health check
+ *  GET  /salud                  → health check (alias)
+ *  GET  /surveys                → lista de encuestas SM
+ *  GET  /surveys/:id/questions  → preguntas de la encuesta
+ *  GET  /sync/list              → lista de syncs activos
+ *  POST /sync/config            → agrega/actualiza el sync de UNA encuesta
+ *  POST /sync/now   { surveyId? } → sync inmediato (1 encuesta o todas)
+ *  POST /sync/stop  { surveyId? } → detiene polling (1 encuesta o todas)
  */
 
 'use strict';
@@ -15,16 +18,16 @@
 const express = require('express');
 const cors    = require('cors');
 const axios   = require('axios');
-const { initializeApp }   = require('firebase/app');
-const { getDatabase, ref, set, get } = require('firebase/database');
+const { initializeApp } = require('firebase/app');
+const { getDatabase, ref, set, get, remove, onValue } = require('firebase/database');
 
 // ──────────────────────────────────────────
-// CONFIG — variables de entorno en Railway
+// CONFIG
 // ──────────────────────────────────────────
-const SM_TOKEN       = process.env.SM_TOKEN;
-const FB_API_KEY     = process.env.FB_API_KEY;
-const FB_DB_URL      = process.env.FB_DB_URL || 'https://control-cuotas-pulso-default-rtdb.firebaseio.com';
-const PORT           = process.env.PORT || 3000;
+const SM_TOKEN   = process.env.SM_TOKEN;
+const FB_API_KEY = process.env.FB_API_KEY;
+const FB_DB_URL  = process.env.FB_DB_URL || 'https://control-cuotas-pulso-default-rtdb.firebaseio.com';
+const PORT       = process.env.PORT || 3000;
 
 // ──────────────────────────────────────────
 // FIREBASE INIT
@@ -40,77 +43,37 @@ try {
 }
 
 // ──────────────────────────────────────────
-// SYNC CONFIG PERSISTENCE — sobrevive reinicios de Railway
-// ──────────────────────────────────────────
-const CONFIG_FB_PATH = 'pulso/syncServerConfig';
-
-async function saveSyncConfigToFirebase(cfg) {
-  // No necesitamos guardar en un path separado —
-  // la config vive en pulso/v4config (escrita por el dashboard)
-}
-
-async function restoreSyncConfigFromFirebase() {
-  if (!fbReady) return;
-  try {
-    // Leer desde pulso/v4config — ya tiene permisos y contiene activeSurveys con colMap
-    const snap = await get(ref(db, 'pulso/v4config'));
-    const raw = snap.val();
-    if (!raw) { console.log('[config] Sin config en Firebase'); return; }
-    const cfg = typeof raw === 'string' ? JSON.parse(raw) : raw;
-
-    // Buscar la primera encuesta activa con colMap configurado
-    const surveys = cfg.activeSurveys || [];
-    const sv = surveys.find(s => s.smSurveyId && s.colMap && s.colMap.gen);
-    if (!sv) { console.log('[config] Sin encuesta activa con colMap'); return; }
-
-    syncConfig = {
-      surveyId:        String(sv.smSurveyId),
-      colMap:          sv.colMap,
-      muestraId:       sv.muestraId,
-      intervalMinutes: Math.max(5, parseInt(sv.intervalMinutes) || 15),
-    };
-
-    // Reiniciar timer
-    if (syncTimer) clearInterval(syncTimer);
-    syncActive = true;
-    const ms = syncConfig.intervalMinutes * 60 * 1000;
-    syncTimer = setInterval(() => {
-      runSync().catch(e => console.error('[sync timer]', e.message));
-    }, ms);
-
-    console.log(`[config] Restaurado desde v4config: survey ${syncConfig.surveyId}, cada ${syncConfig.intervalMinutes} min`);
-
-    // Sync inmediato al restaurar
-    runSync().catch(e => console.error('[config restore → runSync]', e.message));
-  } catch (e) {
-    console.error('[config] Error restaurando:', e.message);
-  }
-}
-
-// ──────────────────────────────────────────
-// EXPRESS SETUP
+// EXPRESS
 // ──────────────────────────────────────────
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // ──────────────────────────────────────────
-// SYNC STATE  (se pierde si Railway reinicia — por diseño)
+// STATE — multi-survey (se pierde si Railway reinicia, restaurado por autoRecover)
 // ──────────────────────────────────────────
-let syncConfig   = null;   // { surveyId, colMap, muestraId, intervalMinutes }
-let syncTimer    = null;
-let syncActive   = false;
-let lastSyncTime = null;
-let choiceCache  = {};     // surveyId → { questionId → { choiceId → text } }
+const syncConfigs   = new Map(); // surveyId(string) → { surveyId, colMap, muestraId, intervalMinutes }
+const syncTimers    = new Map(); // surveyId(string) → setInterval handle
+const lastSyncTimes = new Map(); // surveyId(string) → ISO string
+const choiceCache   = {};         // surveyId(string) → { questionId → { choiceId → text } }
+let configListenerSet = false;
+
+// Mutex serial: solo corre UN runSync a la vez (evita rate-limit SM)
+let _syncChain = Promise.resolve();
+function withSyncLock(fn) {
+  const next = _syncChain.then(() => fn().catch(e => console.error('[sync lock]', e?.message || e)));
+  _syncChain = next.catch(() => {}); // no romper la cadena
+  return next;
+}
 
 // ──────────────────────────────────────────
-// SURVEYMONKEY API HELPER
+// SM API HELPER
 // ──────────────────────────────────────────
 async function smGet(path, params = {}) {
   const res = await axios.get(`https://api.surveymonkey.com/v3${path}`, {
     headers: { Authorization: `Bearer ${SM_TOKEN}`, Accept: 'application/json' },
     params,
-    timeout: 20000,
+    timeout: 30000,
   });
   return res.data;
 }
@@ -122,7 +85,6 @@ function norm(s) {
   return (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
 }
 
-// Aliases de provincia idénticos al dashboard (para match en depto)
 const PROV_ALIASES = {
   'caba':'caba','ciudad autonoma de buenos aires':'caba','ciudad de buenos aires':'caba',
   'capital federal':'caba','buenos aires ciudad':'caba','c.a.b.a.':'caba',
@@ -146,23 +108,20 @@ function normalizeGen(s) {
 }
 
 // ──────────────────────────────────────────
-// BUILD CHOICE LOOKUP for a survey
-// Precarga todos los choices de una encuesta para resolver IDs → texto
+// CHOICE LOOKUP
 // ──────────────────────────────────────────
 async function buildChoiceCache(surveyId) {
+  surveyId = String(surveyId);
   if (choiceCache[surveyId]) return choiceCache[surveyId];
   try {
     const data = await smGet(`/surveys/${surveyId}/details`);
-    const map = {}; // questionId → { choiceId → text }
+    const map = {};
     (data.pages || []).forEach(page => {
       (page.questions || []).forEach(q => {
         const qid = q.id;
         map[qid] = {};
-        // Single-choice answers
         (q.answers?.choices || []).forEach(c => { map[qid][c.id] = c.text; });
-        // Matrix rows
         (q.answers?.rows || []).forEach(r => { map[qid][r.id] = r.text; });
-        // Other / open
         if (q.answers?.other) map[qid][q.answers.other.id] = q.answers.other.text || 'Otro';
       });
     });
@@ -170,180 +129,268 @@ async function buildChoiceCache(surveyId) {
     console.log(`[choice-cache] Survey ${surveyId}: ${Object.keys(map).length} preguntas cacheadas`);
     return map;
   } catch (e) {
-    console.error('[choice-cache] Error:', e.message);
+    console.error(`[choice-cache ${surveyId}] Error:`, e.message);
     return {};
   }
 }
 
-// Resuelve el valor de texto de una respuesta dado el mapa de choices
 function resolveAnswer(answer, choiceMap) {
   if (!answer) return null;
-  // Respuesta abierta / numérica
   if (answer.text) return answer.text;
-  // Choice
-  if (answer.choice_id) {
-    return choiceMap[answer.choice_id] || answer.choice_id;
-  }
+  if (answer.choice_id) return choiceMap[answer.choice_id] || answer.choice_id;
   return null;
 }
 
 // ──────────────────────────────────────────
-// CORE SYNC  — SM → Firebase
+// CORE SYNC — SM → Firebase para UNA encuesta
 // ──────────────────────────────────────────
-async function runSync() {
-  if (!syncConfig) return;
-  const { surveyId, colMap } = syncConfig;
+async function runSync(surveyId) {
+  surveyId = String(surveyId);
+  return withSyncLock(async () => {
+    const cfg = syncConfigs.get(surveyId);
+    if (!cfg) { console.warn(`[sync ${surveyId}] sin config — saltado`); return; }
+    const { colMap } = cfg;
 
-  console.log(`[sync] Iniciando sync para encuesta ${surveyId}...`);
+    console.log(`[sync ${surveyId}] Iniciando...`);
 
-  // Aseguramos tener el mapa de choices
-  const choiceMap = await buildChoiceCache(surveyId);
+    const choiceMap = await buildChoiceCache(surveyId);
 
-  const rawCases = [];
-  let page = 1;
-  let totalResponses = 0;
-  let excluded = 0;
+    const rawCases = [];
+    let page = 1;
+    let totalResponses = 0;
+    let excluded = 0;
 
-  // Paginar todas las respuestas
-  while (true) {
-    let data;
-    try {
-      data = await smGet(`/surveys/${surveyId}/responses/bulk`, {
-        per_page: 100,
-        page,
-      });
-    } catch (e) {
-      console.error(`[sync] Error en página ${page}:`, e.message);
-      break;
-    }
+    while (true) {
+      let data;
+      try {
+        data = await smGet(`/surveys/${surveyId}/responses/bulk`, { per_page: 100, page });
+      } catch (e) {
+        console.error(`[sync ${surveyId}] Error en página ${page}:`, e.message);
+        break;
+      }
 
-    const responses = data.data || [];
-    totalResponses = data.total || totalResponses;
+      const responses = data.data || [];
+      totalResponses = data.total || totalResponses;
 
-    for (const resp of responses) {
-      // SM bulk API devuelve resp.pages[].questions[].answers[]
-      // (NO un array answers plano en la raíz)
-      const qMap = {};
-      for (const page of (resp.pages || [])) {
-        for (const q of (page.questions || [])) {
-          const qid = q.id;
-          if (!qid) continue;
-          const qChoices = choiceMap[qid] || {};
-          for (const ans of (q.answers || [])) {
-            const val = resolveAnswer(ans, qChoices);
-            if (val && !qMap[qid]) qMap[qid] = val;
+      for (const resp of responses) {
+        const qMap = {};
+        for (const pg of (resp.pages || [])) {
+          for (const q of (pg.questions || [])) {
+            const qid = q.id;
+            if (!qid) continue;
+            const qChoices = choiceMap[qid] || {};
+            for (const ans of (q.answers || [])) {
+              const val = resolveAnswer(ans, qChoices);
+              if (val && !qMap[qid]) qMap[qid] = val;
+            }
           }
         }
-      }
 
-      // Aplicar filtro (ej: excluir "not answered" en voto)
-      if (colMap.filterCol && colMap.filterVal) {
-        const filterAns = qMap[colMap.filterCol];
-        // Excluir si no respondió o respondió el valor de exclusión
-        if (!filterAns || norm(filterAns) === norm(colMap.filterVal)) {
-          excluded++;
-          continue;
+        // Filtro de elegibilidad
+        if (colMap.filterCol && colMap.filterVal) {
+          const filterAns = qMap[colMap.filterCol];
+          if (!filterAns || norm(filterAns) === norm(colMap.filterVal)) { excluded++; continue; }
         }
-      }
 
-      // Extraer variables clave
-      const gen   = qMap[colMap.gen]   || '';
-      const edad  = qMap[colMap.edad]  || '';
-      const prov  = qMap[colMap.prov]  || '';
+        const gen   = qMap[colMap.gen]   || '';
+        const edad  = qMap[colMap.edad]  || '';
+        const prov  = qMap[colMap.prov]  || '';
 
-      // Departamento: buscar en el mapa de columnas por provincia
-      let depto = '';
-      if (colMap.depto && prov) {
-        const np = normProv(prov);
-        for (const [provKey, qid] of Object.entries(colMap.depto)) {
-          if (normProv(provKey) === np || normProv(provKey).includes(np) || np.includes(normProv(provKey))) {
-            depto = qMap[qid] || '';
-            break;
+        let depto = '';
+        if (colMap.depto && prov) {
+          const np = normProv(prov);
+          for (const [provKey, qid] of Object.entries(colMap.depto)) {
+            if (normProv(provKey) === np || normProv(provKey).includes(np) || np.includes(normProv(provKey))) {
+              depto = qMap[qid] || '';
+              break;
+            }
           }
         }
+
+        if (!gen || !edad) { excluded++; continue; }
+
+        const caseId = (colMap.idCol && qMap[colMap.idCol])
+          ? String(qMap[colMap.idCol])
+          : String(resp.id || resp.respondent_id || `R${rawCases.length + 1}`);
+
+        rawCases.push({
+          id: caseId, gen: normalizeGen(gen),
+          edad: String(parseInt(edad) || edad),
+          prov, depto,
+        });
       }
 
-      // Saltar si faltan campos críticos
-      if (!gen || !edad) { excluded++; continue; }
+      if (responses.length < 100) break;
+      page++;
+      await new Promise(r => setTimeout(r, 300)); // backoff entre páginas
+    }
 
-      // ID del caso: usar idCol si está mapeado, sino respondent_id
-      const caseId = (colMap.idCol && qMap[colMap.idCol])
-        ? String(qMap[colMap.idCol])
-        : String(resp.id || resp.respondent_id || `R${rawCases.length + 1}`);
+    const payload = {
+      surveyId,
+      rawCases,
+      lastSync: new Date().toISOString(),
+      syncStats: { valid: rawCases.length, excluded, total: totalResponses },
+    };
 
-      rawCases.push({
-        id:    caseId,
-        gen:   normalizeGen(gen),
-        edad:  String(parseInt(edad) || edad),
-        prov,
-        depto,
+    if (fbReady) {
+      try {
+        await set(ref(db, `pulso/v4sync/${surveyId}`), JSON.stringify(payload));
+        lastSyncTimes.set(surveyId, payload.lastSync);
+        console.log(`[sync ${surveyId}] ✓ ${rawCases.length} casos → Firebase (${excluded} excluidos)`);
+      } catch (e) {
+        console.error(`[sync ${surveyId}] Error escribiendo Firebase:`, e.message);
+        throw e;
+      }
+    }
+  });
+}
+
+// ──────────────────────────────────────────
+// TIMER MANAGEMENT
+// ──────────────────────────────────────────
+function startSyncTimer(surveyId) {
+  surveyId = String(surveyId);
+  const cfg = syncConfigs.get(surveyId);
+  if (!cfg) return;
+  const existing = syncTimers.get(surveyId);
+  if (existing) clearInterval(existing);
+  const ms = cfg.intervalMinutes * 60 * 1000;
+  const t = setInterval(() => {
+    runSync(surveyId).catch(e => console.error(`[timer ${surveyId}]`, e.message));
+  }, ms);
+  syncTimers.set(surveyId, t);
+}
+
+function stopSyncTimer(surveyId) {
+  surveyId = String(surveyId);
+  const t = syncTimers.get(surveyId);
+  if (t) clearInterval(t);
+  syncTimers.delete(surveyId);
+  syncConfigs.delete(surveyId);
+}
+
+function stopAllSyncs() {
+  for (const [, t] of syncTimers) clearInterval(t);
+  syncTimers.clear();
+  syncConfigs.clear();
+}
+
+// ──────────────────────────────────────────
+// AUTO-RECOVERY: al arrancar, restaurar todos los syncs activos desde pulso/v4config
+// ──────────────────────────────────────────
+async function autoRecoverSyncConfigs() {
+  if (!fbReady) return;
+  try {
+    const snap = await get(ref(db, 'pulso/v4config'));
+    const raw = snap.val();
+    if (!raw) { console.log('[auto-recover] Sin config en Firebase'); return; }
+    const cfg = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const surveys = Array.isArray(cfg.activeSurveys) ? cfg.activeSurveys : [];
+
+    let restored = 0;
+    for (const sv of surveys) {
+      if (!sv || !sv.smSurveyId) continue;
+      if (!sv.syncActive) continue; // solo restaurar las que estaban activas
+      if (!sv.colMap || !sv.colMap.gen || !sv.colMap.edad || !sv.colMap.prov) continue;
+
+      const surveyId = String(sv.smSurveyId);
+      const interval = Math.max(5, parseInt(sv.intervalMinutes) || 15);
+      syncConfigs.set(surveyId, {
+        surveyId,
+        colMap: sv.colMap,
+        muestraId: sv.muestraId,
+        intervalMinutes: interval,
       });
+      startSyncTimer(surveyId);
+      restored++;
+      console.log(`[auto-recover] ✓ Survey ${surveyId} (${sv.smTitle || ''}) cada ${interval} min`);
+      // Sync inmediato (background; el mutex serializa)
+      runSync(surveyId).catch(e => console.error(`[auto-recover ${surveyId}]`, e.message));
     }
-
-    // ¿Hay más páginas?
-    if (responses.length < 100) break;
-    page++;
-
-    // Pequeña pausa para no agotar rate limit
-    await new Promise(r => setTimeout(r, 300));
-  }
-
-  // Escribir en Firebase: pulso/v4sync/{surveyId}
-  const payload = {
-    surveyId: String(surveyId),
-    rawCases,
-    lastSync: new Date().toISOString(),
-    syncStats: {
-      valid:    rawCases.length,
-      excluded: excluded,
-      total:    totalResponses,
-    },
-  };
-
-  if (fbReady) {
-    try {
-      const syncRef = ref(db, `pulso/v4sync/${surveyId}`);
-      await set(syncRef, JSON.stringify(payload));
-      lastSyncTime = payload.lastSync;
-      console.log(`[sync] ✓ Survey ${surveyId}: ${rawCases.length} casos → Firebase (${excluded} excluidos)`);
-    } catch (e) {
-      console.error('[sync] Error escribiendo en Firebase:', e.message);
-      throw e;
-    }
-  } else {
-    console.warn('[sync] Firebase no disponible — datos no persistidos');
+    console.log(`[auto-recover] Restauradas ${restored} encuesta(s)`);
+  } catch (e) {
+    console.error('[auto-recover] Error:', e.message);
   }
 }
 
 // ──────────────────────────────────────────
-// ROUTES
+// CONFIG LISTENER
+// Detecta cambios en pulso/v4config:
+//  - Encuestas removidas del dashboard → detiene timer + limpia pulso/v4sync/{id}
+//  - syncActive flipped to false → detiene timer (sin borrar datos)
+// (Encuestas nuevas / re-activadas se manejan via /sync/config explícito desde la UI)
 // ──────────────────────────────────────────
+function startConfigListener() {
+  if (!fbReady || configListenerSet) return;
+  configListenerSet = true;
+  onValue(ref(db, 'pulso/v4config'), async (snap) => {
+    try {
+      const raw = snap.val();
+      if (!raw) return;
+      const cfg = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      const dashboardSurveys = Array.isArray(cfg.activeSurveys) ? cfg.activeSurveys : [];
+      const dashboardIds = new Set(dashboardSurveys.map(s => String(s.smSurveyId)).filter(Boolean));
+      const dashboardActiveIds = new Set(
+        dashboardSurveys.filter(s => s.syncActive && s.smSurveyId).map(s => String(s.smSurveyId))
+      );
 
-// GET / — health check
-app.get('/', (req, res) => {
-  res.json({
-    status:     'ok',
-    firebase:   fbReady,
-    sm_token:   !!SM_TOKEN,
-    syncActive,
-    lastSync:   lastSyncTime,
-    config:     syncConfig ? {
-      surveyId:        syncConfig.surveyId,
-      intervalMinutes: syncConfig.intervalMinutes,
-    } : null,
+      // 1) Server tiene corriendo pero ya no está en el dashboard → eliminar
+      for (const surveyId of [...syncConfigs.keys()]) {
+        if (!dashboardIds.has(surveyId)) {
+          console.log(`[listener] Survey ${surveyId} eliminada del dashboard → stop + cleanup`);
+          stopSyncTimer(surveyId);
+          try { await remove(ref(db, `pulso/v4sync/${surveyId}`)); } catch(_) {}
+        }
+      }
+
+      // 2) Server tiene corriendo pero syncActive=false → solo stop (sin borrar datos)
+      for (const surveyId of [...syncConfigs.keys()]) {
+        if (dashboardIds.has(surveyId) && !dashboardActiveIds.has(surveyId)) {
+          console.log(`[listener] Survey ${surveyId} pausada → stop timer`);
+          stopSyncTimer(surveyId);
+        }
+      }
+    } catch (e) {
+      console.error('[listener] Error:', e.message);
+    }
   });
-});
+  console.log('[listener] Config listener activo');
+}
 
-// GET /surveys — lista encuestas SM
-app.get('/surveys', async (req, res) => {
+// ──────────────────────────────────────────
+// ROUTES — health
+// ──────────────────────────────────────────
+function healthPayload() {
+  const surveys = [];
+  for (const [sid, cfg] of syncConfigs) {
+    surveys.push({
+      surveyId: sid,
+      intervalMinutes: cfg.intervalMinutes,
+      lastSync: lastSyncTimes.get(sid) || null,
+      timerActive: syncTimers.has(sid),
+    });
+  }
+  return {
+    status: 'ok',
+    firebase: fbReady,
+    sm_token: !!SM_TOKEN,
+    syncCount: syncConfigs.size,
+    surveys,
+  };
+}
+app.get('/',      (_, res) => res.json(healthPayload()));
+app.get('/salud', (_, res) => res.json(healthPayload()));
+
+// ──────────────────────────────────────────
+// ROUTES — SurveyMonkey passthrough
+// ──────────────────────────────────────────
+app.get('/surveys', async (_, res) => {
   if (!SM_TOKEN) return res.json({ error: 'SM_TOKEN no configurado' });
   try {
     const data = await smGet('/surveys', { per_page: 50, include: 'response_count' });
     res.json({
       surveys: (data.data || []).map(s => ({
-        id:             s.id,
-        title:          s.title,
-        response_count: s.response_count || 0,
+        id: s.id, title: s.title, response_count: s.response_count || 0,
       })),
     });
   } catch (e) {
@@ -352,7 +399,6 @@ app.get('/surveys', async (req, res) => {
   }
 });
 
-// GET /surveys/:id/questions — preguntas de la encuesta
 app.get('/surveys/:id/questions', async (req, res) => {
   if (!SM_TOKEN) return res.json({ error: 'SM_TOKEN no configurado' });
   try {
@@ -360,14 +406,10 @@ app.get('/surveys/:id/questions', async (req, res) => {
     const questions = [];
     (data.pages || []).forEach(page => {
       (page.questions || []).forEach(q => {
-        const heading = q.headings?.[0]?.heading || q.id;
-        questions.push({ id: q.id, heading });
+        questions.push({ id: q.id, heading: q.headings?.[0]?.heading || q.id });
       });
     });
-
-    // Aprovechar para precachear choices
     await buildChoiceCache(req.params.id);
-
     res.json({ questions });
   } catch (e) {
     console.error('[/questions]', e.message);
@@ -375,63 +417,87 @@ app.get('/surveys/:id/questions', async (req, res) => {
   }
 });
 
-// POST /sync/config — configura y arranca polling
+// ──────────────────────────────────────────
+// ROUTES — sync control
+// ──────────────────────────────────────────
+
+// POST /sync/config — agrega o actualiza el sync de UNA encuesta (sin tocar las otras)
 app.post('/sync/config', async (req, res) => {
   const { surveyId, colMap, muestraId, intervalMinutes } = req.body || {};
 
-  if (!surveyId || !colMap) {
-    return res.json({ ok: false, error: 'Faltan surveyId o colMap' });
-  }
-  if (!colMap.gen || !colMap.edad || !colMap.prov) {
-    return res.json({ ok: false, error: 'colMap debe incluir gen, edad y prov' });
-  }
+  if (!surveyId || !colMap)        return res.json({ ok: false, error: 'Faltan surveyId o colMap' });
+  if (!colMap.gen || !colMap.edad || !colMap.prov)
+                                    return res.json({ ok: false, error: 'colMap debe incluir gen, edad y prov' });
 
-  // Guardar config
-  syncConfig = {
-    surveyId: String(surveyId),
-    colMap,
-    muestraId,
-    intervalMinutes: Math.max(5, parseInt(intervalMinutes) || 15),
-  };
+  const sid = String(surveyId);
+  const interval = Math.max(5, parseInt(intervalMinutes) || 15);
 
-  // Limpiar timer anterior
-  if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
+  syncConfigs.set(sid, { surveyId: sid, colMap, muestraId, intervalMinutes: interval });
 
-  // Precachear choices
-  try { await buildChoiceCache(surveyId); } catch (_) {}
+  // Precachear choices (no bloqueante)
+  buildChoiceCache(sid).catch(() => {});
 
-  // Sync inmediato
-  syncActive = true;
-  runSync().catch(e => console.error('[sync/config → runSync]', e.message));
+  // (Re)arrancar timer
+  startSyncTimer(sid);
 
-  // Timer periódico
-  const ms = syncConfig.intervalMinutes * 60 * 1000;
-  syncTimer = setInterval(() => {
-    runSync().catch(e => console.error('[sync timer]', e.message));
-  }, ms);
+  // Sync inmediato en background
+  runSync(sid).catch(e => console.error(`[/sync/config → runSync ${sid}]`, e.message));
 
-  console.log(`[sync/config] Configurado: survey ${surveyId}, cada ${syncConfig.intervalMinutes} min`);
+  console.log(`[/sync/config] Survey ${sid}, cada ${interval} min — total activos: ${syncConfigs.size}`);
   res.json({
-    ok:      true,
-    message: `Sync configurado · cada ${syncConfig.intervalMinutes} min`,
+    ok: true,
+    message: `Sync configurado · cada ${interval} min`,
+    activeCount: syncConfigs.size,
   });
 });
 
-// POST /sync/now — fuerza sync inmediato (fire and forget)
+// POST /sync/now — sync inmediato (1 encuesta o todas)
 app.post('/sync/now', (req, res) => {
-  if (!syncConfig) return res.json({ ok: false, error: 'Sin configuración. Usá /sync/config primero.' });
-  // Responder inmediatamente — no esperar que termine el sync
-  res.json({ ok: true, message: 'Sync iniciado' });
-  // Correr el sync en background
-  runSync().catch(e => console.error('[sync/now]', e.message));
+  const { surveyId } = req.body || {};
+  if (surveyId) {
+    const sid = String(surveyId);
+    if (!syncConfigs.has(sid)) return res.json({ ok: false, error: `Survey ${sid} sin config` });
+    res.json({ ok: true, message: `Sync iniciado para ${sid}` });
+    runSync(sid).catch(e => console.error(`[/sync/now ${sid}]`, e.message));
+  } else {
+    if (syncConfigs.size === 0) return res.json({ ok: false, error: 'Sin configuraciones activas' });
+    const ids = [...syncConfigs.keys()];
+    res.json({ ok: true, message: `Sync iniciado para ${ids.length} encuesta(s)`, surveyIds: ids });
+    for (const sid of ids) {
+      runSync(sid).catch(e => console.error(`[/sync/now ${sid}]`, e.message));
+    }
+  }
 });
 
-// POST /sync/stop — detiene polling
+// POST /sync/stop — detiene polling (1 o todas)
 app.post('/sync/stop', (req, res) => {
-  if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
-  syncActive = false;
-  console.log('[sync/stop] Polling detenido');
-  res.json({ ok: true });
+  const { surveyId } = req.body || {};
+  if (surveyId) {
+    const sid = String(surveyId);
+    stopSyncTimer(sid);
+    console.log(`[/sync/stop] Survey ${sid} detenida — total activos: ${syncConfigs.size}`);
+    res.json({ ok: true, surveyId: sid, activeCount: syncConfigs.size });
+  } else {
+    const count = syncConfigs.size;
+    stopAllSyncs();
+    console.log(`[/sync/stop] Todas las syncs detenidas (${count})`);
+    res.json({ ok: true, stopped: count });
+  }
+});
+
+// GET /sync/list — lista de syncs activos
+app.get('/sync/list', (_, res) => {
+  const surveys = [];
+  for (const [sid, cfg] of syncConfigs) {
+    surveys.push({
+      surveyId: sid,
+      intervalMinutes: cfg.intervalMinutes,
+      muestraId: cfg.muestraId,
+      lastSync: lastSyncTimes.get(sid) || null,
+      timerActive: syncTimers.has(sid),
+    });
+  }
+  res.json({ count: surveys.length, surveys });
 });
 
 // ──────────────────────────────────────────
@@ -441,6 +507,12 @@ app.listen(PORT, async () => {
   console.log(`\n  Pulso Sync Server — puerto ${PORT}`);
   console.log(`  SM Token:  ${SM_TOKEN ? '✓ configurado' : '✗ FALTA SM_TOKEN'}`);
   console.log(`  Firebase:  ${fbReady ? '✓ conectado' : '✗ no disponible'}\n`);
-  // Restaurar config guardada (sobrevive reinicios de Railway)
-  await restoreSyncConfigFromFirebase();
+  if (fbReady) {
+    await autoRecoverSyncConfigs();
+    startConfigListener();
+  }
 });
+
+// Graceful shutdown
+process.on('SIGTERM', () => { console.log('SIGTERM — stopAllSyncs'); stopAllSyncs(); process.exit(0); });
+process.on('SIGINT',  () => { console.log('SIGINT — stopAllSyncs');  stopAllSyncs(); process.exit(0); });
