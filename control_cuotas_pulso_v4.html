@@ -33,13 +33,46 @@
       window._fbSyncRef   = fbSyncRef;
 
       // Config listener: restores muestras, activeSurveys, etc.
+      // PROTECCIÓN ANTI-OVERWRITE: usa lastUpdated para evitar que datos viejos en
+      // Firebase sobreescriban cambios locales más recientes que aún no propagaron
+      // (típico cuando refrescás la página justo después de un cambio).
+      window._fbFirstFire = true;
       onValue(fbConfigRef, (snap) => {
         const data = snap.val();
         if(!data || window._suppressRemote) return;
         try {
           const parsed = JSON.parse(data);
-          // Only restore config fields — never case data
-          const safe = ['muestras','activeSurveys','activeMuestraId','n','warnPct','surveys','cost','nextId','syncServerUrl'];
+          const localTs  = APP.lastUpdated   || 0;
+          const remoteTs = parsed.lastUpdated || 0;
+          const isFirst  = window._fbFirstFire;
+          window._fbFirstFire = false;
+
+          // --- Migración: en la primera carga, si NINGUNO tiene timestamp,
+          // privilegiamos localStorage (probablemente tiene cambios sin propagar).
+          if(isFirst && remoteTs === 0 && localTs === 0){
+            const localHasData = (APP.activeSurveys?.length || APP.muestras?.length || APP.surveys?.length);
+            if(localHasData){
+              console.log('[fb] Primera carga sin timestamps → priorizo localStorage y migro');
+              APP.lastUpdated = Date.now();
+              setTimeout(() => save(), 200);
+              showSync('ok','● Conectado (migrado)');
+              renderHome(); renderMuestras();
+              return;
+            }
+          }
+
+          // --- Datos remotos obsoletos: Firebase tiene datos viejos pero local
+          // tiene cambios más recientes. Re-empujamos local para corregir Firebase.
+          if(remoteTs < localTs){
+            console.warn('[fb] Datos remotos obsoletos (' + new Date(remoteTs).toISOString() +
+                         ' < local ' + new Date(localTs).toISOString() + '). Reenviando local.');
+            setTimeout(() => save(), 200);
+            showSync('ok','● Local + nuevo');
+            return;
+          }
+
+          // --- Aplicar datos remotos (son más nuevos o iguales)
+          const safe = ['lastUpdated','muestras','activeSurveys','activeMuestraId','n','warnPct','surveys','cost','nextId','syncServerUrl'];
           safe.forEach(k => { if(parsed[k] !== undefined) APP[k] = parsed[k]; });
           // Si vino un syncServerUrl, persistirlo en localStorage y reflejarlo en el input
           if(parsed.syncServerUrl){
@@ -47,9 +80,12 @@
             const inp = document.getElementById('sm-server-url');
             if(inp && !inp.value) inp.value = parsed.syncServerUrl;
           }
+          // Persistir en localStorage para que próximos reloads tengan timestamps
+          try { localStorage.setItem('pulsov4', JSON.stringify(APP)); } catch(_){}
           showSync('ok','● Conectado');
           renderHome();
           renderMuestras();
+          renderEncuestas();
           // Re-enviar config al servidor si hay encuesta activa con colMap
           // Esto asegura que el servidor no pierda la config tras un reinicio
           setTimeout(() => reEnviarConfigAlServidor(), 1000);
@@ -1198,11 +1234,14 @@ const DFLT = {
 };
 let APP = {...DFLT};
 
-function save(){
+function save(_retries){
+  if(_retries === undefined) _retries = 1;
   try {
+    APP.lastUpdated = Date.now();
     localStorage.setItem('pulsov4', JSON.stringify(APP));
     // Write only config fields to Firebase (not cases)
     const configData = {
+      lastUpdated: APP.lastUpdated,
       muestras: APP.muestras || [],
       activeSurveys: APP.activeSurveys || [],
       activeMuestraId: APP.activeMuestraId || null,
@@ -1216,9 +1255,23 @@ function save(){
     const fbRef = window._fbConfigRef || window._fbRef;
     if(fbRef && window._fbSet){
       window._suppressRemote = true;
+      // Defensive: if .then/.catch don't fire, clear suppress after 5s anyway
+      clearTimeout(window._suppressRemoteWatchdog);
+      window._suppressRemoteWatchdog = setTimeout(()=>{ window._suppressRemote = false; }, 5000);
       window._fbSet(fbRef, JSON.stringify(configData))
-        .then(()=>{ showSync('ok','● Guardado'); setTimeout(()=>window._suppressRemote=false,1500); })
-        .catch(()=>{ showSync('err','● Error sync'); window._suppressRemote=false; });
+        .then(()=>{
+          showSync('ok','● Guardado');
+          setTimeout(()=>window._suppressRemote=false,1500);
+        })
+        .catch((e)=>{
+          showSync('err','● Error sync');
+          window._suppressRemote=false;
+          console.warn('[save] Firebase error:', e && e.message);
+          if(_retries > 0){
+            // Reintento único tras 2s — captura blips de red
+            setTimeout(()=>save(_retries - 1), 2000);
+          }
+        });
     }
   } catch(e){}
 }
