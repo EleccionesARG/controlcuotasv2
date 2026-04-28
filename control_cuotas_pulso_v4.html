@@ -39,8 +39,14 @@
         try {
           const parsed = JSON.parse(data);
           // Only restore config fields — never case data
-          const safe = ['muestras','activeSurveys','activeMuestraId','n','warnPct','surveys','cost','nextId'];
+          const safe = ['muestras','activeSurveys','activeMuestraId','n','warnPct','surveys','cost','nextId','syncServerUrl'];
           safe.forEach(k => { if(parsed[k] !== undefined) APP[k] = parsed[k]; });
+          // Si vino un syncServerUrl, persistirlo en localStorage y reflejarlo en el input
+          if(parsed.syncServerUrl){
+            try { localStorage.setItem('pulso_sync_url', parsed.syncServerUrl); } catch(_){}
+            const inp = document.getElementById('sm-server-url');
+            if(inp && !inp.value) inp.value = parsed.syncServerUrl;
+          }
           showSync('ok','● Conectado');
           renderHome();
           renderMuestras();
@@ -1205,6 +1211,7 @@ function save(){
       surveys: APP.surveys || [],
       cost: APP.cost || {},
       nextId: APP.nextId || 1,
+      syncServerUrl: APP.syncServerUrl || null,
     };
     const fbRef = window._fbConfigRef || window._fbRef;
     if(fbRef && window._fbSet){
@@ -2660,16 +2667,21 @@ function buildColMap() {
 
 // startSync defined below
 
+// syncNow del panel SM — sin surveyId, el server sincroniza TODAS las encuestas activas
 async function syncNow() {
   const url = getSyncServerUrl() || _smServerUrl;
   if (!url) { alert('Configurá el servidor primero.'); return; }
   const msgEl = document.getElementById('sm-sync-msg');
   if (msgEl) { msgEl.textContent = '⟳ Sincronizando...'; msgEl.style.color = 'var(--amber)'; }
   try {
-    const r = await fetch(`${url}/sync/now`, { method: 'POST' });
+    const r = await fetch(`${url}/sync/now`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
     const data = await r.json();
     if (data.ok) {
-      if (msgEl) { msgEl.textContent = '✓ Sincronización completada'; msgEl.style.color = 'var(--green)'; }
+      if (msgEl) { msgEl.textContent = `✓ ${data.message || 'Sincronización completada'}`; msgEl.style.color = 'var(--green)'; }
     } else {
       throw new Error(data.error);
     }
@@ -2678,14 +2690,25 @@ async function syncNow() {
   }
 }
 
+// stopSync del panel SM — sin surveyId, el server detiene TODAS las encuestas
+// (atajo de emergencia; lo común es usar el botón "Detener" del dashboard de cada encuesta)
 async function stopSync() {
   const url = getSyncServerUrl() || _smServerUrl;
   if (!url) return;
+  if (!confirm('Esto detendrá TODAS las sincronizaciones activas en el servidor. ¿Continuar?')) return;
   try {
-    await fetch(`${url}/sync/stop`, { method: 'POST' });
+    await fetch(`${url}/sync/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
     updateSyncStatus(false, 'Detenido');
+    // Marcar todas las encuestas locales como detenidas
+    (APP.activeSurveys || []).forEach(sv => { sv.syncActive = false; });
+    save();
+    renderHome();
     const msgEl = document.getElementById('sm-sync-msg');
-    if (msgEl) { msgEl.textContent = 'Sync detenido'; msgEl.style.color = 'var(--muted)'; }
+    if (msgEl) { msgEl.textContent = 'Sync detenido (todas)'; msgEl.style.color = 'var(--muted)'; }
   } catch(e) {}
 }
 
@@ -2855,7 +2878,7 @@ function removeSurveyFromHome(idx){
 }
 
 // Called from sync panel when user clicks "Iniciar" — adds survey to home grid
-function addSurveyToHome(smSurveyId, smTitle, muestraId, n, colMap, intervalMinutes){
+function addSurveyToHome(smSurveyId, smTitle, muestraId, n, colMap, intervalMinutes, syncActive){
   if(!APP.activeSurveys) APP.activeSurveys = [];
   const existing = APP.activeSurveys.findIndex(sv => sv.smSurveyId === smSurveyId);
   const m = (APP.muestras||[]).find(x => x.id === muestraId);
@@ -2875,7 +2898,7 @@ function addSurveyToHome(smSurveyId, smTitle, muestraId, n, colMap, intervalMinu
     cases: existing >= 0 ? (APP.activeSurveys[existing].cases||[]) : [],
     quotas,
     lastSync: existing >= 0 ? APP.activeSurveys[existing].lastSync : null,
-    syncActive: false,
+    syncActive: !!syncActive,
     warnPct: APP.warnPct || 80,
   };
 
@@ -2889,7 +2912,7 @@ function addSurveyToHome(smSurveyId, smTitle, muestraId, n, colMap, intervalMinu
 
   save();
   renderHome();
-  console.log(`Survey added: ${smTitle} | Muestra: ${m?.nombre} | Quotas: ${Object.keys(quotas).length}`);
+  console.log(`Survey added: ${smTitle} | Muestra: ${m?.nombre} | Quotas: ${Object.keys(quotas).length} | syncActive: ${entry.syncActive}`);
 }
 
 // ── processRawCases: assign estrato + ageGrp using muestra refTable ──
@@ -2979,33 +3002,57 @@ function updateSurveyFromFirebase(data){
   renderHome();
 }
 
-// Re-envía la config de sync al servidor si la perdió tras un reinicio
+// Re-envía configs faltantes al servidor (por encuesta).
+// Compara las encuestas activas del dashboard con las que el servidor tiene corriendo,
+// y manda /sync/config para las que faltan o cambiaron de intervalo.
 async function reEnviarConfigAlServidor() {
   const url = _smServerUrl || localStorage.getItem('pulso_sync_url');
   if (!url) return;
-  const surveys = APP.activeSurveys || [];
-  const sv = surveys.find(s => s.smSurveyId && s.colMap && s.colMap.gen && s.syncActive);
-  if (!sv) return;
+
+  const surveys = (APP.activeSurveys || [])
+    .filter(s => s && s.smSurveyId && s.colMap && s.colMap.gen && s.syncActive);
+  if (!surveys.length) return;
+
+  let serverActive = new Map(); // surveyId(string) → { intervalMinutes }
   try {
-    // Verificar si el servidor ya tiene config
-    const health = await fetch(`${url}/`, { signal: AbortSignal.timeout(5000) });
-    const hData = await health.json();
-    if (hData.config) return; // servidor ya tiene config, no hacer nada
-    // Servidor sin config — re-enviar
-    console.log('[sync] Servidor sin config, re-enviando...');
-    await fetch(`${url}/sync/config`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        surveyId:        sv.smSurveyId,
-        colMap:          sv.colMap,
-        muestraId:       sv.muestraId,
-        intervalMinutes: sv.intervalMinutes || 15,
-      }),
-    });
-    console.log('[sync] Config re-enviada al servidor');
-  } catch(e) {
-    // Silencioso — no interrumpir el flujo normal
+    // /sync/list es el endpoint multi-survey; si el server es viejo, fallback a /
+    const r = await fetch(`${url}/sync/list`, { signal: AbortSignal.timeout(5000) });
+    if (r.ok) {
+      const d = await r.json();
+      (d.surveys || []).forEach(s => serverActive.set(String(s.surveyId), { intervalMinutes: s.intervalMinutes }));
+    } else { throw new Error('sync/list no disponible'); }
+  } catch(_) {
+    // Fallback: server viejo single-survey en /
+    try {
+      const r2 = await fetch(`${url}/`, { signal: AbortSignal.timeout(5000) });
+      const d2 = await r2.json();
+      if (d2 && d2.config && d2.config.surveyId) {
+        serverActive.set(String(d2.config.surveyId), { intervalMinutes: d2.config.intervalMinutes });
+      }
+    } catch(__) { return; /* no llegamos al server */ }
+  }
+
+  for (const sv of surveys) {
+    const sid = String(sv.smSurveyId);
+    const want = sv.intervalMinutes || 15;
+    const have = serverActive.get(sid);
+    // Skip si ya está corriendo con el mismo intervalo
+    if (have && have.intervalMinutes === want) continue;
+    try {
+      await fetch(`${url}/sync/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          surveyId:        sid,
+          colMap:          sv.colMap,
+          muestraId:       sv.muestraId,
+          intervalMinutes: want,
+        }),
+      });
+      console.log(`[sync] Config re-enviada para ${sid}`);
+    } catch(e) {
+      console.warn(`[sync] No se pudo re-enviar ${sid}:`, e.message);
+    }
   }
 }
 
@@ -3021,10 +3068,8 @@ async function syncNowAll(){
 }
 
 // ══════════════════════════════════════════
-// OVERRIDE goPanel to handle home
+// NAV bindings (ensure dynamic nav-btns work)
 // ══════════════════════════════════════════
-const _origGoPanel = goPanel;
-// redefine below after original is declared — patch nav to include home
 document.querySelectorAll('.nav-btn').forEach(b=>{
   b.addEventListener('click', ()=>{
     if(b.dataset.p) goPanel(b.dataset.p);
@@ -3032,9 +3077,8 @@ document.querySelectorAll('.nav-btn').forEach(b=>{
 });
 
 // ══════════════════════════════════════════
-// PATCH startSync to also add to home grid
+// startSync: configura sync en el server + agrega encuesta al home
 // ══════════════════════════════════════════
-const _origStartSync = startSync;
 async function startSync(){
   const url = getSyncServerUrl() || _smServerUrl;
   const surveyId = document.getElementById('sm-survey-select')?.value;
@@ -3068,9 +3112,9 @@ async function startSync(){
       APP.syncServerUrl = url;
       _smServerUrl = url;
       save();
-      // Add to home grid
+      // Add to home grid (con syncActive=true porque el server confirmó el config)
       const cleanTitle = surveyTitle.replace(/\s*\(\d+ respuestas\)$/, '');
-      addSurveyToHome(surveyId, cleanTitle, muestraId, n, colMap, intervalMinutes);
+      addSurveyToHome(surveyId, cleanTitle, muestraId, n, colMap, intervalMinutes, true);
       if(msgEl){ msgEl.innerHTML = `✓ Encuesta agregada al panel de inicio. <a href="#" onclick="volverHome();goPanel('home')" style="color:var(--green)">Ver panel →</a>`; }
     } else { throw new Error(data.error || 'Error desconocido'); }
   } catch(e){
@@ -3447,9 +3491,14 @@ async function dashSyncStart(){
 async function dashSyncStop(){
   const url = getDashSyncUrl();
   if(!url){ return; }
+  const idx = APP.currentSurveyIdx;
+  const sv  = (idx != null) ? APP.activeSurveys?.[idx] : null;
   try {
-    await fetch(`${url}/sync/stop`, { method: 'POST' });
-    const idx = APP.currentSurveyIdx;
+    await fetch(`${url}/sync/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sv?.smSurveyId ? { surveyId: sv.smSurveyId } : {}),
+    });
     if(idx != null && APP.activeSurveys[idx]){
       APP.activeSurveys[idx].syncActive = false;
     }
@@ -3464,8 +3513,13 @@ async function dashSyncNow(){
   const btn = document.querySelector('[onclick="dashSyncNow()"]');
   if(!url){ alert('Configurá el servidor primero.'); return; }
   if(btn){ btn.textContent='⟳'; btn.disabled=true; }
+  const sv = getCurrentSurvey();
   try {
-    await fetch(`${url}/sync/now`, { method: 'POST' });
+    await fetch(`${url}/sync/now`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sv?.smSurveyId ? { surveyId: sv.smSurveyId } : {}),
+    });
     if(btn){ btn.textContent='✓'; setTimeout(()=>{ btn.textContent='⟳'; btn.disabled=false; }, 1500); }
   } catch(e){
     if(btn){ btn.textContent='✗'; btn.disabled=false; }
