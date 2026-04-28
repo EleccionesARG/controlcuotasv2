@@ -527,7 +527,7 @@ body.observer-mode .observer-badge{display:inline-block}
     <div class="rb-stat"><span class="rb-label">Casos</span><span class="rb-val" id="sb-casos">0</span></div>
     <div class="rb-stat"><span class="rb-label">Avance</span><span class="rb-val" id="sb-avance" style="color:var(--amber)">—</span></div>
     <button class="btn-reset" onclick="openModal('reset-modal')">↺ Reiniciar</button>
-    <div style="font-family:var(--mono);font-size:9px;color:var(--muted2);margin-top:8px;text-align:center" id="pulso-version-tag">v4.7.2</div>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--muted2);margin-top:8px;text-align:center" id="pulso-version-tag">v4.7.3</div>
   </div>
 </nav>
 
@@ -1236,51 +1236,110 @@ const DFLT = {
 };
 let APP = {...DFLT};
 
+// Intenta liberar espacio en localStorage comprimiendo snapshots viejos.
+// Los snapshots legacy guardaban {...APP} entero (cases + surveys recursivos),
+// lo que causaba crecimiento exponencial. Esto los reduce a metadata.
+function _cleanupLocalStorageSurveys(){
+  if(!APP.surveys || !APP.surveys.length) return 0;
+  let compressed = 0;
+  APP.surveys = APP.surveys.map(s => {
+    if(!s || !s.fullState) return s;
+    try {
+      const fs = JSON.parse(s.fullState);
+      let mod = false;
+      if('surveys' in fs){ delete fs.surveys; mod = true; }      // recursión
+      if('cases' in fs){ delete fs.cases; mod = true; }          // redundante
+      if(Array.isArray(fs.activeSurveys)){
+        fs.activeSurveys = fs.activeSurveys.map(sv => {
+          if(sv && ('cases' in sv || '_rawCases' in sv)){
+            const lite = {...sv};
+            delete lite.cases; delete lite._rawCases;
+            mod = true;
+            return lite;
+          }
+          return sv;
+        });
+      }
+      if(mod){ compressed++; return {...s, fullState: JSON.stringify(fs)}; }
+    } catch(_){}
+    return s;
+  });
+  if(compressed) console.warn(`[pulso:save] cleanup: ${compressed} snapshot(s) comprimidos`);
+  return compressed;
+}
+
+function _trySetLocalStorage(){
+  try {
+    localStorage.setItem('pulsov4', JSON.stringify(APP));
+    return true;
+  } catch(e){
+    return false;
+  }
+}
+
 function save(_retries){
   if(_retries === undefined) _retries = 1;
-  try {
-    APP.lastUpdated = Date.now();
-    localStorage.setItem('pulsov4', JSON.stringify(APP));
-    // Write only config fields to Firebase (not cases)
-    const configData = {
-      lastUpdated: APP.lastUpdated,
-      muestras: APP.muestras || [],
-      activeSurveys: APP.activeSurveys || [],
-      activeMuestraId: APP.activeMuestraId || null,
-      n: APP.n || 2500,
-      warnPct: APP.warnPct || 80,
-      surveys: APP.surveys || [],
-      cost: APP.cost || {},
-      nextId: APP.nextId || 1,
-      syncServerUrl: APP.syncServerUrl || null,
-    };
-    console.log(`[pulso:save] ts=${APP.lastUpdated} AS=${configData.activeSurveys.length} surv=${configData.surveys.length} retries=${_retries}`);
-    const fbRef = window._fbConfigRef || window._fbRef;
-    if(fbRef && window._fbSet){
-      window._suppressRemote = true;
-      // Defensive: if .then/.catch don't fire, clear suppress after 5s anyway
-      clearTimeout(window._suppressRemoteWatchdog);
-      window._suppressRemoteWatchdog = setTimeout(()=>{ window._suppressRemote = false; }, 5000);
-      window._fbSet(fbRef, JSON.stringify(configData))
-        .then(()=>{
-          console.log(`[pulso:save] ✓ Firebase confirmó ts=${configData.lastUpdated}`);
-          showSync('ok','● Guardado');
-          setTimeout(()=>window._suppressRemote=false,1500);
-        })
-        .catch((e)=>{
-          console.error('[pulso:save] ✗ Firebase error:', e && e.message);
-          showSync('err','● Error sync');
-          window._suppressRemote=false;
-          if(_retries > 0){
-            // Reintento único tras 2s — captura blips de red
-            setTimeout(()=>save(_retries - 1), 2000);
-          }
-        });
+  APP.lastUpdated = Date.now();
+
+  // ═══ Paso 1: localStorage (best-effort, NO aborta el save si falla) ═══
+  let localOk = _trySetLocalStorage();
+  if(!localOk){
+    console.warn('[pulso:save] localStorage lleno → intentando cleanup');
+    _cleanupLocalStorageSurveys();
+    localOk = _trySetLocalStorage();
+    if(!localOk){
+      // Último recurso: avisarle al usuario que localStorage está saturado.
+      // Firebase sigue funcionando, así que los datos NO se pierden.
+      console.error('[pulso:save] localStorage sigue lleno tras cleanup');
+      showSync('err','● localStorage lleno');
     } else {
-      console.warn('[pulso:save] sin Firebase ref → solo localStorage');
+      console.log('[pulso:save] localStorage OK tras cleanup');
     }
-  } catch(e){
-    console.error('[pulso:save] excepción:', e);
+  }
+
+  // ═══ Paso 2: Firebase (siempre se intenta, aunque localStorage haya fallado) ═══
+  const configData = {
+    lastUpdated: APP.lastUpdated,
+    muestras: APP.muestras || [],
+    activeSurveys: APP.activeSurveys || [],
+    activeMuestraId: APP.activeMuestraId || null,
+    n: APP.n || 2500,
+    warnPct: APP.warnPct || 80,
+    surveys: APP.surveys || [],
+    cost: APP.cost || {},
+    nextId: APP.nextId || 1,
+    syncServerUrl: APP.syncServerUrl || null,
+  };
+  console.log(`[pulso:save] ts=${APP.lastUpdated} AS=${configData.activeSurveys.length} surv=${configData.surveys.length} retries=${_retries} localOk=${localOk}`);
+  const fbRef = window._fbConfigRef || window._fbRef;
+  if(fbRef && window._fbSet){
+    window._suppressRemote = true;
+    clearTimeout(window._suppressRemoteWatchdog);
+    window._suppressRemoteWatchdog = setTimeout(()=>{ window._suppressRemote = false; }, 5000);
+    let payload;
+    try { payload = JSON.stringify(configData); }
+    catch(eJson){
+      console.error('[pulso:save] JSON.stringify falló:', eJson);
+      window._suppressRemote = false;
+      return;
+    }
+    window._fbSet(fbRef, payload)
+      .then(()=>{
+        console.log(`[pulso:save] ✓ Firebase confirmó ts=${configData.lastUpdated}`);
+        if(localOk) showSync('ok','● Guardado');
+        else        showSync('ok','● Guardado (solo Firebase)');
+        setTimeout(()=>window._suppressRemote=false,1500);
+      })
+      .catch((e)=>{
+        console.error('[pulso:save] ✗ Firebase error:', e && e.message);
+        showSync('err','● Error sync');
+        window._suppressRemote=false;
+        if(_retries > 0){
+          setTimeout(()=>save(_retries - 1), 2000);
+        }
+      });
+  } else {
+    console.warn('[pulso:save] sin Firebase ref → solo localStorage');
   }
 }
 function load(){
@@ -2498,13 +2557,31 @@ function confirmSaveSurvey(){
   const m=getActiveMuestra();
   const keys=Object.keys(APP.quotas).filter(k=>APP.quotas[k]>0);
   const closed=keys.filter(k=>{const[g,ag,e]=cParts(k);return APP.quotas[k]>0&&countCell(g,ag,e)>=APP.quotas[k];}).length;
+  // Snapshot LIGERO: NO incluye `cases` (redundante con activeSurveys),
+  // NO incluye `surveys` (causa recursión exponencial → quota exceeded),
+  // NO incluye `_rawCases` per-survey (también redundante).
+  const stateLite = {
+    muestras: APP.muestras || [],
+    activeMuestraId: APP.activeMuestraId || null,
+    n: APP.n,
+    warnPct: APP.warnPct,
+    cost: APP.cost,
+    nextId: APP.nextId,
+    activeSurveys: (APP.activeSurveys||[]).map(sv => {
+      if(!sv) return sv;
+      const lite = {...sv};
+      delete lite.cases;
+      delete lite._rawCases;
+      return lite;
+    }),
+  };
   const snap={
     id:Date.now(), titulo, notas, fecha:new Date().toLocaleDateString('es-AR'),
     casos:APP.cases.length, jovenes:countJovenes(), n:APP.n,
     pct:APP.n>0?Math.round(APP.cases.length/APP.n*100):0,
     cerradas:closed, totalCuotas:keys.length,
     muestra:m?.nombre||'—', cost:APP.cost,
-    fullState:JSON.stringify({...APP})
+    fullState:JSON.stringify(stateLite)
   };
   APP.surveys=APP.surveys||[];
   APP.surveys.unshift(snap);
@@ -3688,7 +3765,7 @@ function renderEstrato4(){
 // ══════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════
-const PULSO_VERSION = 'v4.7.2-multi-survey-fix-2026-04-28';
+const PULSO_VERSION = 'v4.7.3-quota-fix-2026-04-28';
 load();
 console.log(`%c[pulso:init] ${PULSO_VERSION}`, 'background:#3ecf8e;color:#000;padding:3px 8px;font-weight:bold');
 console.log(`[pulso:init] localStorage cargado: ts=${APP.lastUpdated || 'NUNCA'} AS=${(APP.activeSurveys||[]).length} surv=${(APP.surveys||[]).length} muestras=${(APP.muestras||[]).length}`);
