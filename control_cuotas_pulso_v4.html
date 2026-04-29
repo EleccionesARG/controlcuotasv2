@@ -527,7 +527,7 @@ body.observer-mode .observer-badge{display:inline-block}
     <div class="rb-stat"><span class="rb-label">Casos</span><span class="rb-val" id="sb-casos">0</span></div>
     <div class="rb-stat"><span class="rb-label">Avance</span><span class="rb-val" id="sb-avance" style="color:var(--amber)">—</span></div>
     <button class="btn-reset" onclick="openModal('reset-modal')">↺ Reiniciar</button>
-    <div style="font-family:var(--mono);font-size:9px;color:var(--muted2);margin-top:8px;text-align:center" id="pulso-version-tag">v4.7.6</div>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--muted2);margin-top:8px;text-align:center" id="pulso-version-tag">v4.7.7</div>
   </div>
 </nav>
 
@@ -1430,10 +1430,11 @@ function normProv(s){ const n=norm(s); return PROV_ALIASES[n]||n; }
 // Lookup estrato from active muestra's refTable
 // Estrategia de matching (en orden):
 //   1. Override por provincia (fixedEstrato)
-//   2. Match exacto por prov+depto (con normalización de tildes/case)
-//   3. Match flexible: includes()
-//   4. Si cobertura nacional/custom: si hay UN solo estrato para la provincia, usar ese
-//   5. Si cobertura provincial/municipal: match solo por depto
+//   2. cobertura provincial/municipal: match por nivel2 (con prov o depto)
+//      - el caso puede traer el valor en `prov` (ej: Perú manda "Lima" como provincia, pero tu refTable lo tiene en nivel2)
+//      - o en `depto` (caso normal: depto mapeado correctamente)
+//   3. cobertura nacional/custom: match por nivel1+nivel2
+//   4. Fallback: si una provincia tiene UN solo estrato, usar ese
 function lookupEst(prov, depto, m){
   if(!m) m = getActiveMuestra();
   if(!m || !m.refTable || !m.refTable.length) return null;
@@ -1444,22 +1445,33 @@ function lookupEst(prov, depto, m){
   if(m.fixedEstrato){
     const fo = m.fixedEstrato;
     if(fo[pn] !== undefined && fo[pn] !== null) return fo[pn];
-    // También probar el formato original sin normalizar
     if(prov && fo[prov] !== undefined) return fo[prov];
   }
 
   let r = null;
 
-  // 2) Match exacto + 3) flexible — depende de cobertura
+  // 2) Cobertura provincial/municipal: matchea por nivel2 del refTable
   if(m.cobertura === 'provincial' || m.cobertura === 'municipal'){
-    // Solo importa el depto/nivel2 (la provincia es fija)
-    r = m.refTable.find(x => norm(x.nivel2) === dn);
-    if(!r && dn) r = m.refTable.find(x => {
-      const n2 = norm(x.nivel2);
-      return n2.includes(dn) || dn.includes(n2);
-    });
+    // 2a) Probar primero con depto si viene
+    if(dn) r = m.refTable.find(x => norm(x.nivel2) === dn);
+    // 2b) Probar con prov contra nivel2 (típico cuando SM manda el dato en la pregunta "provincia"
+    //     pero la cobertura es provincial — Perú: SM manda "Lima" como prov, refTable lo tiene en nivel2)
+    if(!r && pn) r = m.refTable.find(x => normProv(x.nivel2) === pn || norm(x.nivel2) === pn);
+    // 2c) Match flexible includes() con cualquiera de los dos
+    if(!r && dn){
+      r = m.refTable.find(x => {
+        const n2 = norm(x.nivel2);
+        return n2.includes(dn) || dn.includes(n2);
+      });
+    }
+    if(!r && pn){
+      r = m.refTable.find(x => {
+        const n2 = normProv(x.nivel2);
+        return n2.includes(pn) || pn.includes(n2);
+      });
+    }
   } else {
-    // Nacional o custom: prov + depto
+    // 3) Cobertura nacional/custom
     r = m.refTable.find(x => normProv(x.nivel1) === pn && norm(x.nivel2) === dn);
     if(!r && dn){
       r = m.refTable.find(x => {
@@ -1473,7 +1485,7 @@ function lookupEst(prov, depto, m){
       const provRows = m.refTable.filter(x => normProv(x.nivel1) === pn);
       const uniqueEst = [...new Set(provRows.map(x => String(x.estrato)).filter(e => e !== 'null' && e !== 'undefined'))];
       if(uniqueEst.length === 1){
-        return uniqueEst[0]; // toda la provincia mapea al mismo estrato
+        return uniqueEst[0];
       }
     }
   }
@@ -3521,6 +3533,33 @@ async function startSync(){
   const colMap = buildColMap();
   if(!colMap.gen || !colMap.edad || !colMap.prov){ alert('Mapeá al menos Género, Edad y Provincia.'); return; }
 
+  // Advertir si la muestra puede necesitar mapeo de depto
+  const muestra = (APP.muestras||[]).find(m => m.id === muestraId);
+  if(muestra && muestra.cobertura !== 'provincial' && muestra.cobertura !== 'municipal'){
+    // Cobertura nacional/custom: ver si hay provincias con MÚLTIPLES estratos (necesitan depto)
+    const provsConMultiplesEstratos = new Map();
+    (muestra.refTable||[]).forEach(row => {
+      if(!row.nivel1) return;
+      const k = norm(row.nivel1);
+      if(!provsConMultiplesEstratos.has(k)) provsConMultiplesEstratos.set(k, new Set());
+      provsConMultiplesEstratos.get(k).add(String(row.estrato));
+    });
+    const provsAmbiguas = [...provsConMultiplesEstratos.entries()]
+      .filter(([k, ests]) => ests.size > 1)
+      .map(([k]) => k);
+
+    if(provsAmbiguas.length > 0 && Object.keys(colMap.depto || {}).length === 0){
+      const lista = provsAmbiguas.slice(0, 5).join(', ') + (provsAmbiguas.length > 5 ? '...' : '');
+      const ok = confirm(
+        `⚠️ Atención: la muestra "${muestra.nombre}" tiene ${provsAmbiguas.length} provincia(s) con múltiples estratos (${lista}).\n\n` +
+        `No mapeaste la pregunta de departamento/localidad, así que esos casos NO van a poder asignar estrato correctamente. ` +
+        `Solo CABA y provincias con un único estrato van a funcionar.\n\n` +
+        `¿Querés continuar igual? (Recomendado: Cancelar y mapear la pregunta de depto en "Preguntas de departamento" más abajo)`
+      );
+      if(!ok) return;
+    }
+  }
+
   const msgEl = document.getElementById('sm-sync-msg');
   if(msgEl){ msgEl.textContent = 'Configurando...'; msgEl.style.color = 'var(--muted)'; }
 
@@ -4171,7 +4210,7 @@ function renderEstrato4(){
 // ══════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════
-const PULSO_VERSION = 'v4.7.6-strata-diagnostic-2026-04-28';
+const PULSO_VERSION = 'v4.7.7-prov-as-nivel2-2026-04-29';
 load();
 console.log(`%c[pulso:init] ${PULSO_VERSION}`, 'background:#3ecf8e;color:#000;padding:3px 8px;font-weight:bold');
 console.log(`[pulso:init] localStorage cargado: ts=${APP.lastUpdated || 'NUNCA'} AS=${(APP.activeSurveys||[]).length} surv=${(APP.surveys||[]).length} muestras=${(APP.muestras||[]).length}`);
