@@ -76,7 +76,7 @@
 
           // --- CASO 3: Firebase es más nuevo o igual → aplicar
           console.log('[pulso:fb] aplicando datos de Firebase (más nuevo o igual)');
-          const safe = ['lastUpdated','muestras','activeSurveys','activeMuestraId','n','warnPct','surveys','cost','nextId','syncServerUrl'];
+          const safe = ['lastUpdated','muestras','activeSurveys','activeMuestraId','n','warnPct','surveys','cost','nextId','syncServerUrl','fechaInicio'];
           safe.forEach(k => { if(parsed[k] !== undefined) APP[k] = parsed[k]; });
           if(parsed.syncServerUrl){
             try { localStorage.setItem('pulso_sync_url', parsed.syncServerUrl); } catch(_){}
@@ -527,7 +527,7 @@ body.observer-mode .observer-badge{display:inline-block}
     <div class="rb-stat"><span class="rb-label">Casos</span><span class="rb-val" id="sb-casos">0</span></div>
     <div class="rb-stat"><span class="rb-label">Avance</span><span class="rb-val" id="sb-avance" style="color:var(--amber)">—</span></div>
     <button class="btn-reset" onclick="openModal('reset-modal')">↺ Reiniciar</button>
-    <div style="font-family:var(--mono);font-size:9px;color:var(--muted2);margin-top:8px;text-align:center" id="pulso-version-tag">v4.7.3</div>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--muted2);margin-top:8px;text-align:center" id="pulso-version-tag">v4.7.4</div>
   </div>
 </nav>
 
@@ -1176,6 +1176,15 @@ body.observer-mode .observer-badge{display:inline-block}
   </div>
 </div>
 
+<!-- Detalle de encuesta guardada -->
+<div class="modal-bg" id="enc-detalle-modal">
+  <div class="modal" style="max-width:680px;max-height:85vh;overflow-y:auto">
+    <button class="modal-close" onclick="closeModal('enc-detalle-modal')">✕</button>
+    <div class="modal-title" id="enc-detalle-titulo">Detalle de encuesta</div>
+    <div id="enc-detalle-content" style="margin-top:14px"></div>
+  </div>
+</div>
+
 <!-- Reset modal -->
 <div class="modal-bg" id="reset-modal">
   <div class="modal" style="max-width:380px">
@@ -1309,6 +1318,7 @@ function save(_retries){
     cost: APP.cost || {},
     nextId: APP.nextId || 1,
     syncServerUrl: APP.syncServerUrl || null,
+    fechaInicio: APP.fechaInicio || null,
   };
   console.log(`[pulso:save] ts=${APP.lastUpdated} AS=${configData.activeSurveys.length} surv=${configData.surveys.length} retries=${_retries} localOk=${localOk}`);
   const fbRef = window._fbConfigRef || window._fbRef;
@@ -1778,6 +1788,8 @@ function confirmActivate(){
   APP.n=n;
   APP.warnPct=warnPct;
   APP.quotas=quotas;
+  // Fecha de inicio del trabajo de campo (la primera vez que se activa con esta muestra)
+  if(!APP.fechaInicio) APP.fechaInicio = Date.now();
   save();
   closeModal('activate-modal');
   renderMuestras();
@@ -2555,46 +2567,185 @@ function confirmSaveSurvey(){
   if(!titulo){alert('Ingresá un título.');return;}
   const notas=(document.getElementById('enc-notas')?.value||'').trim();
   const m=getActiveMuestra();
-  const keys=Object.keys(APP.quotas).filter(k=>APP.quotas[k]>0);
+  const keys=Object.keys(APP.quotas||{}).filter(k=>APP.quotas[k]>0);
   const closed=keys.filter(k=>{const[g,ag,e]=cParts(k);return APP.quotas[k]>0&&countCell(g,ag,e)>=APP.quotas[k];}).length;
-  // Snapshot LIGERO: NO incluye `cases` (redundante con activeSurveys),
-  // NO incluye `surveys` (causa recursión exponencial → quota exceeded),
-  // NO incluye `_rawCases` per-survey (también redundante).
-  const stateLite = {
-    muestras: APP.muestras || [],
-    activeMuestraId: APP.activeMuestraId || null,
-    n: APP.n,
-    warnPct: APP.warnPct,
-    cost: APP.cost,
-    nextId: APP.nextId,
-    activeSurveys: (APP.activeSurveys||[]).map(sv => {
-      if(!sv) return sv;
-      const lite = {...sv};
-      delete lite.cases;
-      delete lite._rawCases;
-      return lite;
-    }),
-  };
+
+  // Distribución por estrato (cuántos casos en cada estrato)
+  const distEstrato = {};
+  (APP.cases||[]).forEach(c=>{
+    const e = String(c.estrato || '?');
+    distEstrato[e] = (distEstrato[e] || 0) + 1;
+  });
+
+  // Distribución por género
+  const distGen = { Femenino: 0, Masculino: 0, Otro: 0 };
+  (APP.cases||[]).forEach(c=>{
+    const g = c.gen || 'Otro';
+    if(distGen[g] !== undefined) distGen[g]++; else distGen.Otro++;
+  });
+
+  // Distribución por grupo etario
+  const distEdad = {};
+  (APP.cases||[]).forEach(c=>{
+    const ag = c.ageGrp || '?';
+    distEdad[ag] = (distEdad[ag] || 0) + 1;
+  });
+
+  const cost = APP.cost || {};
+  const moneda = cost.moneda || '$';
+  const total = cost.total || 0;
+  const porCaso = APP.cases.length > 0 ? Math.round(total / APP.cases.length) : 0;
+
+  // Snapshot SOLO con metadata útil — sin fullState, sin recursión
   const snap={
-    id:Date.now(), titulo, notas, fecha:new Date().toLocaleDateString('es-AR'),
-    casos:APP.cases.length, jovenes:countJovenes(), n:APP.n,
-    pct:APP.n>0?Math.round(APP.cases.length/APP.n*100):0,
-    cerradas:closed, totalCuotas:keys.length,
-    muestra:m?.nombre||'—', cost:APP.cost,
-    fullState:JSON.stringify(stateLite)
+    id: Date.now(),
+    titulo,
+    notas,
+    fecha: new Date().toLocaleDateString('es-AR'),       // fecha de guardado (display)
+    fechaGuardadoTs: Date.now(),                          // timestamp numérico
+    fechaInicio: APP.fechaInicio || null,                 // cuando se activó la muestra
+    fechaInicioStr: APP.fechaInicio ? new Date(APP.fechaInicio).toLocaleDateString('es-AR') : '—',
+    casos: APP.cases.length,
+    jovenes: countJovenes(),
+    n: APP.n,
+    pct: APP.n>0 ? Math.round(APP.cases.length/APP.n*100) : 0,
+    cerradas: closed,
+    totalCuotas: keys.length,
+    muestra: m?.nombre || '—',
+    cobertura: m?.cobertura || null,
+    estratos: m?.estratos || [],
+    ageGroups: m?.ageGroups || [],
+    distEstrato,
+    distGen,
+    distEdad,
+    cost: {
+      moneda,
+      total,
+      porCaso,
+      // detalle por concepto si existe
+      items: Array.isArray(cost.items) ? cost.items : null,
+    },
   };
-  APP.surveys=APP.surveys||[];
+  APP.surveys = APP.surveys || [];
   APP.surveys.unshift(snap);
-  save(); closeModal('save-survey-modal');
-  document.getElementById('enc-titulo').value=''; document.getElementById('enc-notas').value='';
-  renderEncuestas(); alert(`✓ "${titulo}" guardada.`);
+  save();
+  closeModal('save-survey-modal');
+  document.getElementById('enc-titulo').value='';
+  document.getElementById('enc-notas').value='';
+  renderEncuestas();
+  alert(`✓ "${titulo}" guardada.`);
 }
-function loadSurvey(id){
-  const s=APP.surveys?.find(x=>x.id===id); if(!s)return;
-  if(!confirm(`¿Reactivar "${s.titulo}"? Reemplazará el estado actual.`))return;
-  try{ Object.assign(APP,JSON.parse(s.fullState)); save(); renderAll(); renderEncuestas(); renderCostWidget(); goPanel('dashboard'); }
-  catch(e){alert('Error: '+e.message);}
+// Antes existía loadSurvey() que reemplazaba todo el estado actual con el snapshot.
+// Ahora preferimos un panel de detalle (no destructivo). Para compat con snapshots
+// legacy que tengan fullState, se ofrece igualmente el botón "Reactivar".
+function verSurveyDetalle(id){
+  const s = APP.surveys?.find(x => x.id === id);
+  if(!s) return;
+  const cont = document.getElementById('enc-detalle-content');
+  const titEl = document.getElementById('enc-detalle-titulo');
+  if(!cont || !titEl) return;
+  titEl.textContent = s.titulo || 'Encuesta guardada';
+
+  const moneda = s.cost?.moneda || '$';
+  const total = s.cost?.total || 0;
+  const porCaso = s.cost?.porCaso || (s.casos > 0 && total > 0 ? Math.round(total / s.casos) : 0);
+  const fmt = v => (v || 0).toLocaleString('es-AR');
+  const fechaInicio = s.fechaInicioStr || (s.fechaInicio ? new Date(s.fechaInicio).toLocaleDateString('es-AR') : '—');
+
+  // Renderizar distribuciones si existen
+  const renderDist = (label, dist, totalCasos) => {
+    if(!dist || !Object.keys(dist).length) return '';
+    const entries = Object.entries(dist).sort((a,b) => b[1] - a[1]);
+    return `<div style="margin-bottom:14px">
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px">${label}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        ${entries.map(([k,v]) => {
+          const pct = totalCasos > 0 ? Math.round(v/totalCasos*100) : 0;
+          return `<div style="background:var(--s2);border:1px solid var(--border);border-radius:5px;padding:5px 10px;font-size:11.5px;font-family:var(--mono)">
+            <span style="color:var(--text)">${k}</span>: <span style="color:var(--green);font-weight:700">${fmt(v)}</span> <span style="color:var(--muted)">(${pct}%)</span>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>`;
+  };
+
+  const itemsRows = Array.isArray(s.cost?.items) && s.cost.items.length
+    ? `<div style="margin-top:14px">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px">Detalle de costos</div>
+        <table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead><tr style="border-bottom:1px solid var(--border);color:var(--muted)"><th style="text-align:left;padding:6px 4px">Concepto</th><th style="text-align:right;padding:6px 4px">Monto</th></tr></thead>
+          <tbody>${s.cost.items.map(it => `<tr style="border-bottom:1px solid var(--border)"><td style="padding:6px 4px">${it.nombre || it.label || '—'}</td><td style="text-align:right;padding:6px 4px;font-family:var(--mono)">${moneda} ${fmt(it.monto || it.value || 0)}</td></tr>`).join('')}</tbody>
+        </table>
+      </div>`
+    : '';
+
+  const isLegacy = !!s.fullState; // snapshots viejos
+  const reactivarBtn = isLegacy
+    ? `<button class="btn btn-w" onclick="loadSurveyLegacy(${s.id})">↩ Reactivar (legacy)</button>`
+    : '';
+
+  cont.innerHTML = `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:18px">
+      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:12px">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em">Casos</div>
+        <div style="font-size:22px;font-weight:700;font-family:var(--mono);margin-top:4px">${fmt(s.casos)} <span style="font-size:13px;color:var(--muted);font-weight:400">/ ${fmt(s.n)}</span></div>
+        <div style="font-size:11px;color:${s.pct>=100?'var(--red)':s.pct>=80?'var(--amber)':'var(--green)'};margin-top:2px">${s.pct}% completado</div>
+      </div>
+      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:12px">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em">Jóvenes (≤29)</div>
+        <div style="font-size:22px;font-weight:700;font-family:var(--mono);margin-top:4px;color:var(--purple)">${fmt(s.jovenes)}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">${s.casos > 0 ? Math.round((s.jovenes||0)/s.casos*100) : 0}% del total</div>
+      </div>
+      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:12px">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em">Costo total</div>
+        <div style="font-size:22px;font-weight:700;font-family:var(--mono);margin-top:4px;color:var(--amber)">${moneda} ${fmt(total)}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">${moneda} ${fmt(porCaso)} / caso</div>
+      </div>
+      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:12px">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em">Cuotas</div>
+        <div style="font-size:22px;font-weight:700;font-family:var(--mono);margin-top:4px">${s.cerradas||0} <span style="font-size:13px;color:var(--muted);font-weight:400">/ ${s.totalCuotas||0}</span></div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">cerradas / total</div>
+      </div>
+    </div>
+
+    <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:18px;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
+      <div><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em">Muestra</div><div style="font-size:13px;font-weight:600;margin-top:3px">${s.muestra || '—'}</div></div>
+      ${s.cobertura ? `<div><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em">Cobertura</div><div style="font-size:13px;font-weight:600;margin-top:3px">${s.cobertura}</div></div>` : ''}
+      <div><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em">Fecha de inicio</div><div style="font-size:13px;font-weight:600;margin-top:3px">${fechaInicio}</div></div>
+      <div><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em">Fecha de guardado</div><div style="font-size:13px;font-weight:600;margin-top:3px">${s.fecha || '—'}</div></div>
+    </div>
+
+    ${renderDist('Distribución por estrato',     s.distEstrato, s.casos)}
+    ${renderDist('Distribución por género',      s.distGen,     s.casos)}
+    ${renderDist('Distribución por grupo etario',s.distEdad,    s.casos)}
+
+    ${itemsRows}
+
+    ${s.notas ? `<div style="margin-top:18px;padding:12px;background:var(--s2);border-left:3px solid var(--purple);border-radius:6px"><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:4px">Notas</div><div style="font-size:13px;font-style:italic">${s.notas}</div></div>` : ''}
+
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:22px">
+      ${reactivarBtn}
+      <button class="btn btn-w" onclick="closeModal('enc-detalle-modal')">Cerrar</button>
+    </div>
+  `;
+  openModal('enc-detalle-modal');
 }
+
+// Compat: para snapshots legacy con fullState, mantener el botón Reactivar
+function loadSurveyLegacy(id){
+  const s = APP.surveys?.find(x => x.id === id);
+  if(!s || !s.fullState) return;
+  if(!confirm(`¿Reactivar "${s.titulo}"? Reemplazará el estado actual.`)) return;
+  try{
+    Object.assign(APP, JSON.parse(s.fullState));
+    save(); renderAll(); renderEncuestas(); renderCostWidget();
+    closeModal('enc-detalle-modal');
+    goPanel('dashboard');
+  } catch(e){ alert('Error: '+e.message); }
+}
+
+// Mantener nombre antiguo loadSurvey por si lo llama código viejo o un onclick estático
+function loadSurvey(id){ verSurveyDetalle(id); }
 function deleteSurvey(id){
   const s=APP.surveys?.find(x=>x.id===id); if(!s)return;
   if(!confirm(`¿Eliminar "${s.titulo}"?`))return;
@@ -2606,27 +2757,32 @@ function renderEncuestas(){
   if(!surveys.length){el.innerHTML='<div class="empty-state"><div class="empty-icon">◈</div><div class="empty-title">Sin encuestas guardadas</div><div class="empty-sub">Guardá el estado actual con el botón de arriba.</div></div>';return;}
   el.innerHTML=surveys.map(s=>{
     const moneda=s.cost?.moneda||'$'; const total=s.cost?.total||0;
-    const porCaso=s.casos>0&&total>0?Math.round(total/s.casos):0;
-    const pct=Math.min(s.pct,100);
+    const porCaso=s.cost?.porCaso || (s.casos>0&&total>0?Math.round(total/s.casos):0);
+    const pct=Math.min(s.pct||0,100);
     const bc=pct>=100?'var(--red)':pct>=80?'var(--amber)':'var(--green)';
+    const fechaInicio = s.fechaInicioStr || (s.fechaInicio ? new Date(s.fechaInicio).toLocaleDateString('es-AR') : null);
     return`<div style="background:var(--s1);border:1px solid var(--border);border-radius:11px;padding:18px 20px;margin-bottom:10px;display:grid;grid-template-columns:1fr auto;gap:14px">
       <div>
         <div style="font-size:15px;font-weight:700;margin-bottom:3px">${s.titulo}</div>
         <div style="font-size:11.5px;color:var(--muted);margin-bottom:8px;display:flex;gap:12px;flex-wrap:wrap">
-          <span>📅 ${s.fecha}</span><span>📊 ${s.casos.toLocaleString('es-AR')} / ${s.n.toLocaleString('es-AR')} casos</span>
+          ${fechaInicio?`<span>▶ Inicio ${fechaInicio}</span>`:''}
+          <span>📅 Guardado ${s.fecha}</span>
+          <span>📊 ${(s.casos||0).toLocaleString('es-AR')} / ${(s.n||0).toLocaleString('es-AR')} casos</span>
           <span style="color:${bc};font-weight:700">${pct}%</span>
           ${s.muestra&&s.muestra!=='—'?`<span>◑ ${s.muestra}</span>`:''}
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-          <div style="background:var(--s2);border:1px solid var(--border);border-radius:5px;padding:4px 9px;font-size:11px;font-family:var(--mono)">${s.casos.toLocaleString('es-AR')} casos</div>
+          <div style="background:var(--s2);border:1px solid var(--border);border-radius:5px;padding:4px 9px;font-size:11px;font-family:var(--mono)">${(s.casos||0).toLocaleString('es-AR')} casos</div>
           <div style="background:var(--s2);border:1px solid var(--border);border-radius:5px;padding:4px 9px;font-size:11px;font-family:var(--mono);color:var(--purple)">${s.jovenes||0} jóvenes</div>
+          ${total>0?`<div style="background:var(--s2);border:1px solid var(--border);border-radius:5px;padding:4px 9px;font-size:11px;font-family:var(--mono);color:var(--amber)">${moneda} ${total.toLocaleString('es-AR')} total</div>`:''}
           ${porCaso>0?`<div style="background:var(--s2);border:1px solid var(--border);border-radius:5px;padding:4px 9px;font-size:11px;font-family:var(--mono);color:var(--amber)">${moneda} ${porCaso.toLocaleString('es-AR')}/caso</div>`:''}
+          ${s.totalCuotas>0?`<div style="background:var(--s2);border:1px solid var(--border);border-radius:5px;padding:4px 9px;font-size:11px;font-family:var(--mono);color:var(--muted)">${s.cerradas||0}/${s.totalCuotas} cuotas</div>`:''}
         </div>
         <div style="height:3px;background:var(--s3);border-radius:2px;overflow:hidden;margin-top:6px"><div style="height:100%;width:${pct}%;background:${bc};border-radius:2px"></div></div>
         ${s.notas?`<div style="font-size:12px;color:var(--muted);margin-top:7px;font-style:italic">"${s.notas}"</div>`:''}
       </div>
       <div style="display:flex;flex-direction:column;gap:7px;align-items:flex-end">
-        <button class="btn btn-w" style="font-size:12px" onclick="loadSurvey(${s.id})">↩ Reactivar</button>
+        <button class="btn btn-g" style="font-size:12px" onclick="verSurveyDetalle(${s.id})">◉ Ver detalle</button>
         <button class="btn btn-d" style="font-size:11px" onclick="deleteSurvey(${s.id})">✕ Eliminar</button>
       </div>
     </div>`;
@@ -3765,12 +3921,57 @@ function renderEstrato4(){
 // ══════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════
-const PULSO_VERSION = 'v4.7.3-quota-fix-2026-04-28';
+const PULSO_VERSION = 'v4.7.4-light-snapshots-2026-04-28';
 load();
 console.log(`%c[pulso:init] ${PULSO_VERSION}`, 'background:#3ecf8e;color:#000;padding:3px 8px;font-weight:bold');
 console.log(`[pulso:init] localStorage cargado: ts=${APP.lastUpdated || 'NUNCA'} AS=${(APP.activeSurveys||[]).length} surv=${(APP.surveys||[]).length} muestras=${(APP.muestras||[]).length}`);
 if(!APP.activeSurveys) APP.activeSurveys = [];
 if(!APP.surveys) APP.surveys = [];
+
+// ─── Cleanup automático one-shot: comprimir snapshots legacy ───
+// Los snapshots viejos tenían fullState que incluía cases + surveys recursivos.
+// Eso saturaba localStorage. Acá se reduce ese fullState a un objeto mínimo
+// (solo lo necesario para el modo "Reactivar legacy") y se preservan los
+// metadatos de display que siempre estuvieron en el snapshot.
+(function compressLegacySnapshots(){
+  let compressed = 0, removed = 0;
+  APP.surveys = (APP.surveys || []).map(s => {
+    if(!s || !s.fullState) return s;
+    try {
+      const fs = JSON.parse(s.fullState);
+      // Si el fullState es enorme (>50KB), eliminarlo del todo.
+      // De todas formas el snapshot conserva todos los metadatos display.
+      if(s.fullState.length > 50000){
+        const lite = {...s};
+        delete lite.fullState;
+        removed++;
+        return lite;
+      }
+      // Compresión: quitar campos pesados del fullState
+      let mod = false;
+      if('surveys' in fs){ delete fs.surveys; mod = true; }
+      if('cases' in fs){ delete fs.cases; mod = true; }
+      if(Array.isArray(fs.activeSurveys)){
+        fs.activeSurveys = fs.activeSurveys.map(sv => {
+          if(sv && ('cases' in sv || '_rawCases' in sv)){
+            const lite = {...sv};
+            delete lite.cases; delete lite._rawCases;
+            mod = true; return lite;
+          }
+          return sv;
+        });
+      }
+      if(mod){ compressed++; return {...s, fullState: JSON.stringify(fs)}; }
+    } catch(_){}
+    return s;
+  });
+  if(compressed || removed){
+    console.warn(`[pulso:init] cleanup snapshots legacy: comprimidos=${compressed} eliminados=${removed}`);
+    // Persistir el cleanup
+    try { localStorage.setItem('pulsov4', JSON.stringify(APP)); } catch(_){}
+  }
+})();
+
 // Always start with clean global state — survey data lives in activeSurveys[].cases
 // APP.cases is only a "working copy" populated when entering a specific survey
 APP.cases  = [];
