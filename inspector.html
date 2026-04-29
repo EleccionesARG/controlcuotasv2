@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Pulso Inspector — diagnóstico de muestras y casos</title>
+<style>
+  body { font-family: 'Inter', -apple-system, sans-serif; background:#0e0e0e; color:#f0ede8; padding:24px; max-width:1200px; margin:0 auto; line-height:1.5; }
+  h1 { font-size:22px; border-bottom:1px solid #333; padding-bottom:10px; margin-bottom:18px }
+  h2 { font-size:17px; color:#3ecf8e; margin:24px 0 10px }
+  h3 { font-size:14px; color:#a78bfa; margin:18px 0 6px; text-transform:uppercase; letter-spacing:.05em }
+  .box { background:#1a1a1a; border:1px solid #2a2a2a; border-radius:8px; padding:16px; margin-bottom:14px }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; margin-top:8px }
+  th { text-align:left; padding:8px; background:#222; border-bottom:1px solid #333; font-size:11px; text-transform:uppercase }
+  td { padding:6px 8px; border-bottom:1px solid #232323; font-family:'JetBrains Mono', monospace }
+  .ok { color:#3ecf8e } .fail { color:#e05a5a } .warn { color:#f0a62e } .muted { color:#717171 }
+  .pill { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600 }
+  .pill.ok { background:rgba(62,207,142,.15); color:#3ecf8e }
+  .pill.fail { background:rgba(224,90,90,.15); color:#e05a5a }
+  .pill.warn { background:rgba(240,166,46,.15); color:#f0a62e }
+  pre { background:#0a0a0a; padding:10px; border-radius:5px; overflow:auto; font-size:11.5px; max-height:400px }
+  button { padding:9px 18px; background:#3ecf8e; color:#000; border:0; border-radius:5px; font-weight:600; cursor:pointer }
+  .note { background:rgba(167,139,250,.08); border-left:3px solid #a78bfa; padding:10px 14px; border-radius:0 6px 6px 0; font-size:12.5px; margin-bottom:10px }
+</style>
+</head>
+<body>
+<h1>🔬 Pulso Inspector — diagnóstico de asignación de estratos</h1>
+
+<div class="note">
+Esta página solo lee Firebase, no modifica nada. Te dice exactamente qué hay en tus muestras y por qué los casos no matchean estratos. Cuando termine, copiame el contenido del bloque "📋 RESUMEN PARA COPIAR" y lo pegás en el chat.
+</div>
+
+<button onclick="run()">▶ Ejecutar diagnóstico</button>
+
+<div id="output" style="margin-top:24px"></div>
+
+<pre id="resumen" style="display:none;background:#000;color:#3ecf8e;border:2px solid #3ecf8e;margin-top:24px"></pre>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getDatabase, ref, get } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyBIiw9xRGrTWrSohBmn5YJFMPV_KCWLPa0",
+  authDomain: "control-cuotas-pulso.firebaseapp.com",
+  databaseURL: "https://control-cuotas-pulso-default-rtdb.firebaseio.com",
+  projectId: "control-cuotas-pulso",
+};
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
+
+function norm(s){ return (s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim(); }
+const PROV_ALIASES = {
+  'caba':'caba','ciudad autonoma de buenos aires':'caba','ciudad de buenos aires':'caba',
+  'capital federal':'caba','buenos aires ciudad':'caba','c.a.b.a.':'caba','c.a.b.a':'caba',
+  'buenos aires':'buenos aires','buenos aires provincia':'buenos aires','provincia de buenos aires':'buenos aires',
+};
+function normProv(s){ const n=norm(s); return PROV_ALIASES[n]||n; }
+
+function lookupEst(prov, depto, m){
+  if(!m || !m.refTable || !m.refTable.length) return {est: null, why: 'sin refTable'};
+  const pn = normProv(prov);
+  const dn = norm(depto);
+
+  if(m.fixedEstrato){
+    const fo = m.fixedEstrato;
+    if(fo[pn] !== undefined && fo[pn] !== null) return {est: String(fo[pn]), why: `fixedEstrato[${pn}]`};
+    if(prov && fo[prov] !== undefined) return {est: String(fo[prov]), why: `fixedEstrato[${prov}]`};
+  }
+
+  let r = null, why = '';
+  if(m.cobertura === 'provincial' || m.cobertura === 'municipal'){
+    r = m.refTable.find(x => norm(x.nivel2) === dn);
+    if(r) why = `match exacto depto: ${r.nivel2}`;
+    if(!r && dn){
+      r = m.refTable.find(x => {
+        const n2 = norm(x.nivel2);
+        return n2.includes(dn) || dn.includes(n2);
+      });
+      if(r) why = `match flexible depto: ${r.nivel2}`;
+    }
+  } else {
+    r = m.refTable.find(x => normProv(x.nivel1) === pn && norm(x.nivel2) === dn);
+    if(r) why = `match exacto prov+depto: ${r.nivel1} / ${r.nivel2}`;
+    if(!r && dn){
+      r = m.refTable.find(x => {
+        const n1 = normProv(x.nivel1);
+        const n2 = norm(x.nivel2);
+        return n1 === pn && (n2.includes(dn) || dn.includes(n2));
+      });
+      if(r) why = `match flexible: ${r.nivel1} / ${r.nivel2}`;
+    }
+    if(!r && pn){
+      const provRows = m.refTable.filter(x => normProv(x.nivel1) === pn);
+      const uniqueEst = [...new Set(provRows.map(x => String(x.estrato)).filter(e => e !== 'null' && e !== 'undefined'))];
+      if(uniqueEst.length === 1){
+        return {est: uniqueEst[0], why: `provincia "${prov}" mapea a único estrato ${uniqueEst[0]}`};
+      }
+    }
+  }
+
+  if(!r) return {est: null, why: `sin match (prov="${prov}" pn="${pn}" depto="${depto}" dn="${dn}")`};
+  return {est: (r.estrato!==null && r.estrato!==undefined) ? String(r.estrato) : null, why};
+}
+
+window.run = async function(){
+  const out = document.getElementById('output');
+  out.innerHTML = '<div class="muted">⟳ Leyendo Firebase...</div>';
+  let resumen = '';
+  const log = (s) => { resumen += s + '\n'; };
+
+  try {
+    // 1) Leer config
+    const cfgSnap = await get(ref(db, 'pulso/v4config'));
+    const cfgRaw = cfgSnap.val();
+    if(!cfgRaw){ out.innerHTML = '<div class="fail">No hay config en Firebase</div>'; return; }
+    const cfg = typeof cfgRaw === 'string' ? JSON.parse(cfgRaw) : cfgRaw;
+
+    let html = '<h2>📦 Estado en Firebase</h2>';
+    html += `<div class="box">
+      <div>Muestras: <strong>${(cfg.muestras||[]).length}</strong></div>
+      <div>Encuestas activas: <strong>${(cfg.activeSurveys||[]).length}</strong></div>
+      <div>Última actualización: <strong>${cfg.lastUpdated ? new Date(cfg.lastUpdated).toLocaleString('es-AR') : '—'}</strong></div>
+    </div>`;
+
+    log('=== PULSO INSPECTOR ===');
+    log(`Fecha: ${new Date().toISOString()}`);
+    log(`Muestras: ${(cfg.muestras||[]).length}`);
+    log(`Encuestas activas: ${(cfg.activeSurveys||[]).length}`);
+    log('');
+
+    // 2) Para cada muestra, mostrar refTable resumen
+    html += '<h2>🗺️ Muestras configuradas</h2>';
+    for(const m of (cfg.muestras||[])){
+      const ref = m.refTable || [];
+      const estratosUnicos = [...new Set(ref.map(r => String(r.estrato)))].sort();
+      const provsUnicas = [...new Set(ref.map(r => r.nivel1))].filter(Boolean).sort();
+
+      html += `<div class="box">
+        <h3>${m.nombre} (id: ${m.id})</h3>
+        <div>Cobertura: <span class="pill ok">${m.cobertura}</span></div>
+        <div style="margin-top:6px">refTable: <strong>${ref.length}</strong> filas · <strong>${estratosUnicos.length}</strong> estratos: ${estratosUnicos.map(e=>`<span class="pill warn">${e}</span>`).join(' ')}</div>
+        <div style="margin-top:6px">Provincias en refTable: <strong>${provsUnicas.length}</strong> ${provsUnicas.length<20 ? '— '+provsUnicas.join(', ') : ''}</div>
+        <div style="margin-top:6px">fixedEstrato: <code>${JSON.stringify(m.fixedEstrato||{})}</code></div>
+        <div style="margin-top:6px">ageGroups: ${(m.ageGroups||[]).join(', ')}</div>
+
+        <h3 style="margin-top:14px">Ejemplos de refTable (primeras 15 filas)</h3>
+        <table>
+          <thead><tr><th>nivel1 (prov)</th><th>nivel2 (depto)</th><th>estrato</th></tr></thead>
+          <tbody>${ref.slice(0,15).map(r=>`<tr><td>${r.nivel1||'<em class=muted>(vacío)</em>'}</td><td>${r.nivel2||'<em class=muted>(vacío)</em>'}</td><td class="ok">${r.estrato}</td></tr>`).join('')}</tbody>
+        </table>
+      </div>`;
+
+      log(`MUESTRA: ${m.nombre}`);
+      log(`  Cobertura: ${m.cobertura}`);
+      log(`  refTable: ${ref.length} filas`);
+      log(`  Estratos: ${estratosUnicos.join(', ')}`);
+      log(`  Provincias en refTable: ${provsUnicas.join(' | ')}`);
+      log(`  fixedEstrato: ${JSON.stringify(m.fixedEstrato||{})}`);
+      log(`  Primeras 5 filas:`);
+      ref.slice(0,5).forEach(r => log(`    ["${r.nivel1}", "${r.nivel2}", "${r.estrato}"]`));
+      log('');
+    }
+
+    // 3) Para cada encuesta activa, leer pulso/v4sync/{surveyId} y mostrar primeros casos crudos
+    html += '<h2>📥 Casos crudos por encuesta (lo que llega de SurveyMonkey)</h2>';
+    for(const sv of (cfg.activeSurveys||[])){
+      if(!sv.smSurveyId){ continue; }
+      const muestra = (cfg.muestras||[]).find(m => m.id === sv.muestraId);
+      if(!muestra){ continue; }
+
+      log(`ENCUESTA: ${sv.smTitle} (id ${sv.smSurveyId})`);
+      log(`  Muestra asignada: ${muestra.nombre}`);
+      log(`  colMap.depto: ${JSON.stringify(sv.colMap?.depto || {})}`);
+
+      // Leer datos crudos
+      const syncSnap = await get(ref(db, `pulso/v4sync/${sv.smSurveyId}`));
+      const syncRaw = syncSnap.val();
+      if(!syncRaw){ html += `<div class="box"><h3>${sv.smTitle}</h3><div class="warn">Sin datos en Firebase</div></div>`; continue; }
+      const sync = typeof syncRaw === 'string' ? JSON.parse(syncRaw) : syncRaw;
+      const rawCases = sync.rawCases || [];
+
+      // Agrupar por combinación prov+depto, calcular asignación
+      const combos = new Map();
+      for(const rc of rawCases){
+        const k = `${rc.prov||''}||${rc.depto||''}`;
+        if(!combos.has(k)){
+          const r = lookupEst(rc.prov, rc.depto, muestra);
+          combos.set(k, { prov: rc.prov, depto: rc.depto, count: 0, est: r.est, why: r.why });
+        }
+        combos.get(k).count++;
+      }
+      const arr = [...combos.values()].sort((a,b)=>b.count-a.count);
+      const okCount = arr.filter(c=>c.est!==null).reduce((a,c)=>a+c.count,0);
+      const failCount = rawCases.length - okCount;
+
+      log(`  Casos crudos: ${rawCases.length}`);
+      log(`  Asignan estrato: ${okCount}`);
+      log(`  NO asignan: ${failCount}`);
+      log(`  Combinaciones únicas (prov, depto, count, estratoAsignado, motivo):`);
+      arr.slice(0,30).forEach(c => log(`    ${c.count}× | "${c.prov}" | "${c.depto}" | ${c.est===null?'?':c.est} | ${c.why}`));
+      log('');
+
+      html += `<div class="box">
+        <h3>${sv.smTitle}</h3>
+        <div>Muestra: <strong>${muestra.nombre}</strong> · Casos crudos: <strong>${rawCases.length}</strong> · Asignan estrato: <span class="ok"><strong>${okCount}</strong></span> · No asignan: <span class="fail"><strong>${failCount}</strong></span></div>
+        <div style="margin-top:6px;font-size:11.5px" class="muted">colMap.depto enviado al server: <code>${JSON.stringify(sv.colMap?.depto || {})}</code></div>
+
+        <h3>Combinaciones únicas prov+depto que llegan</h3>
+        <table>
+          <thead><tr><th>Cantidad</th><th>prov (de SM)</th><th>depto (de SM)</th><th>Asigna a</th><th>Motivo / debug</th></tr></thead>
+          <tbody>${arr.map(c=>`<tr>
+            <td>${c.count}</td>
+            <td>${c.prov||'<em class=muted>(vacío)</em>'}</td>
+            <td>${c.depto||'<em class=muted>(vacío)</em>'}</td>
+            <td class="${c.est===null?'fail':'ok'}">${c.est===null ? '✗ —' : '✓ '+c.est}</td>
+            <td class="muted" style="font-size:11px">${c.why}</td>
+          </tr>`).join('')}</tbody>
+        </table>
+      </div>`;
+    }
+
+    out.innerHTML = html;
+
+    document.getElementById('resumen').style.display = 'block';
+    document.getElementById('resumen').textContent = '📋 RESUMEN PARA COPIAR Y PEGAR EN EL CHAT:\n\n' + resumen;
+  } catch(e){
+    out.innerHTML = `<div class="fail">Error: ${e.message}</div>`;
+    console.error(e);
+  }
+};
+</script>
+</body>
+</html>
