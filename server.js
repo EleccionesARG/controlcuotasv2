@@ -197,12 +197,30 @@ async function runSync(surveyId) {
         const prov  = qMap[colMap.prov]  || '';
 
         let depto = '';
-        if (colMap.depto && prov) {
+        if (colMap.depto && Object.keys(colMap.depto).length) {
           const np = normProv(prov);
-          for (const [provKey, qid] of Object.entries(colMap.depto)) {
-            if (normProv(provKey) === np || normProv(provKey).includes(np) || np.includes(normProv(provKey))) {
-              depto = qMap[qid] || '';
-              break;
+          // 1) Match por provincia (cobertura nacional/custom)
+          if (np) {
+            for (const [provKey, qid] of Object.entries(colMap.depto)) {
+              const npk = normProv(provKey);
+              if (npk === np || npk.includes(np) || np.includes(npk)) {
+                depto = qMap[qid] || '';
+                break;
+              }
+            }
+          }
+          // 2) Si solo hay UN mapeo (cobertura provincial/municipal) o no hubo match,
+          //    usar el primer (único) qid disponible. Esto hace que provincial/municipal
+          //    funcione aunque la "provincia virtual" no matchee el valor de prov.
+          if (!depto) {
+            const entries = Object.entries(colMap.depto);
+            if (entries.length === 1) {
+              depto = qMap[entries[0][1]] || '';
+            } else if (entries.length > 0) {
+              // Última estrategia: probar TODAS las preguntas mapeadas y tomar la primera con respuesta
+              for (const [, qid] of entries) {
+                if (qMap[qid]) { depto = qMap[qid]; break; }
+              }
             }
           }
         }
@@ -498,6 +516,94 @@ app.get('/sync/list', (_, res) => {
     });
   }
   res.json({ count: surveys.length, surveys });
+});
+
+// GET /sync/preview/:surveyId — devuelve los primeros 30 casos crudos (sin filtrar)
+// para que el dashboard pueda diagnosticar qué prov/depto viene de SM
+// Recibe el colMap como query string params: ?gen=Q1&edad=Q2&prov=Q3
+app.get('/sync/preview/:surveyId', async (req, res) => {
+  if (!SM_TOKEN) return res.json({ error: 'SM_TOKEN no configurado' });
+  const surveyId = String(req.params.surveyId);
+  const cfg = syncConfigs.get(surveyId);
+  // Usamos el colMap del cfg si existe, o el de query
+  const colMap = cfg
+    ? cfg.colMap
+    : { gen: req.query.gen, edad: req.query.edad, prov: req.query.prov, depto: {} };
+  if (!colMap.gen || !colMap.edad) {
+    return res.json({ error: 'Falta colMap (gen, edad, prov). Configurá la encuesta primero.' });
+  }
+
+  try {
+    const choiceMap = await buildChoiceCache(surveyId);
+    const data = await smGet(`/surveys/${surveyId}/responses/bulk`, { per_page: 30, page: 1 });
+    const samples = [];
+    for (const resp of (data.data || [])) {
+      const qMap = {};
+      for (const pg of (resp.pages || [])) {
+        for (const q of (pg.questions || [])) {
+          if (!q.id) continue;
+          const qChoices = choiceMap[q.id] || {};
+          for (const ans of (q.answers || [])) {
+            const val = resolveAnswer(ans, qChoices);
+            if (val && !qMap[q.id]) qMap[q.id] = val;
+          }
+        }
+      }
+
+      // Replicar la lógica de extracción de depto del runSync
+      const prov = qMap[colMap.prov] || '';
+      let depto = '';
+      let deptoSource = null;
+      if (colMap.depto && Object.keys(colMap.depto).length) {
+        const np = normProv(prov);
+        if (np) {
+          for (const [provKey, qid] of Object.entries(colMap.depto)) {
+            const npk = normProv(provKey);
+            if (npk === np || npk.includes(np) || np.includes(npk)) {
+              depto = qMap[qid] || '';
+              deptoSource = `prov-match: ${provKey} → qid ${qid}`;
+              break;
+            }
+          }
+        }
+        if (!depto) {
+          const entries = Object.entries(colMap.depto);
+          if (entries.length === 1) {
+            depto = qMap[entries[0][1]] || '';
+            deptoSource = `single-mapping: ${entries[0][0]} → qid ${entries[0][1]}`;
+          } else if (entries.length > 0) {
+            for (const [provKey, qid] of entries) {
+              if (qMap[qid]) {
+                depto = qMap[qid];
+                deptoSource = `fallback first-non-empty: ${provKey} → qid ${qid}`;
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      samples.push({
+        responseId: resp.id,
+        gen: qMap[colMap.gen] || null,
+        edad: qMap[colMap.edad] || null,
+        prov,
+        depto,
+        deptoSource,
+        // todas las respuestas para que el usuario vea qué hay disponible
+        allAnswers: qMap,
+      });
+    }
+    res.json({
+      surveyId,
+      count: samples.length,
+      colMap,
+      samples,
+    });
+  } catch (e) {
+    console.error('[/sync/preview]', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ──────────────────────────────────────────
