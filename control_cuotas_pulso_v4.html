@@ -527,7 +527,7 @@ body.observer-mode .observer-badge{display:inline-block}
     <div class="rb-stat"><span class="rb-label">Casos</span><span class="rb-val" id="sb-casos">0</span></div>
     <div class="rb-stat"><span class="rb-label">Avance</span><span class="rb-val" id="sb-avance" style="color:var(--amber)">—</span></div>
     <button class="btn-reset" onclick="openModal('reset-modal')">↺ Reiniciar</button>
-    <div style="font-family:var(--mono);font-size:9px;color:var(--muted2);margin-top:8px;text-align:center" id="pulso-version-tag">v4.7.4</div>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--muted2);margin-top:8px;text-align:center" id="pulso-version-tag">v4.7.6</div>
   </div>
 </nav>
 
@@ -567,6 +567,7 @@ body.observer-mode .observer-badge{display:inline-block}
     <button class="btn btn-g" style="font-size:12px;padding:7px 14px" id="dsb-start-btn" onclick="dashSyncStart()">▶ Iniciar sync</button>
     <button class="btn btn-w" style="font-size:12px;padding:7px 14px" id="dsb-stop-btn" onclick="dashSyncStop()" style="display:none">■ Detener</button>
     <button class="btn btn-w" style="font-size:12px;padding:7px 12px" onclick="dashSyncNow()" title="Sincronizar ahora">⟳</button>
+    <button class="btn btn-w" style="font-size:12px;padding:7px 12px" onclick="dashSyncDiagnostico()" title="Ver casos crudos para diagnosticar mapping">🔍</button>
     <div style="width:1px;height:20px;background:var(--border);margin:0 2px"></div>
     <button class="btn btn-w" style="font-size:12px;padding:7px 14px" onclick="goPanel('cargar')" title="Cargar casos desde CSV manualmente">↑ CSV</button>
   </div>
@@ -1185,6 +1186,16 @@ body.observer-mode .observer-badge{display:inline-block}
   </div>
 </div>
 
+<!-- Diagnóstico de mapping SM ↔ refTable -->
+<div class="modal-bg" id="diag-modal">
+  <div class="modal" style="max-width:920px;max-height:88vh;overflow-y:auto">
+    <button class="modal-close" onclick="closeModal('diag-modal')">✕</button>
+    <div class="modal-title" id="diag-titulo">Diagnóstico de asignación de estratos</div>
+    <div class="modal-sub">Compara los casos crudos que llegan de SurveyMonkey contra el refTable de la muestra.</div>
+    <div id="diag-content" style="margin-top:18px"></div>
+  </div>
+</div>
+
 <!-- Reset modal -->
 <div class="modal-bg" id="reset-modal">
   <div class="modal" style="max-width:380px">
@@ -1416,25 +1427,59 @@ const PROV_ALIASES = {
 function normProv(s){ const n=norm(s); return PROV_ALIASES[n]||n; }
 
 // Lookup estrato from active muestra's refTable
+// Lookup estrato from active muestra's refTable
+// Estrategia de matching (en orden):
+//   1. Override por provincia (fixedEstrato)
+//   2. Match exacto por prov+depto (con normalización de tildes/case)
+//   3. Match flexible: includes()
+//   4. Si cobertura nacional/custom: si hay UN solo estrato para la provincia, usar ese
+//   5. Si cobertura provincial/municipal: match solo por depto
 function lookupEst(prov, depto, m){
-  // m can be passed explicitly (for batch processing) or fallback to active muestra
   if(!m) m = getActiveMuestra();
-  if(!m || !m.refTable) return null;
+  if(!m || !m.refTable || !m.refTable.length) return null;
   const pn = normProv(prov);
-
-  // Fixed overrides
-  if(m.fixedEstrato){ const fo=m.fixedEstrato; if(fo[pn]!==undefined) return fo[pn]; }
-
   const dn = norm(depto);
-  let r;
-  if(m.cobertura==='provincial'||m.cobertura==='municipal'){
-    r = m.refTable.find(x=>norm(x.nivel2)===dn);
-    if(!r) r = m.refTable.find(x=>norm(x.nivel2).includes(dn)||dn.includes(norm(x.nivel2)));
-  } else {
-    r = m.refTable.find(x=>normProv(x.nivel1)===pn&&norm(x.nivel2)===dn);
-    if(!r) r = m.refTable.find(x=>normProv(x.nivel1)===pn&&(norm(x.nivel2).includes(dn)||dn.includes(norm(x.nivel2))));
+
+  // 1) Fixed overrides por provincia
+  if(m.fixedEstrato){
+    const fo = m.fixedEstrato;
+    if(fo[pn] !== undefined && fo[pn] !== null) return fo[pn];
+    // También probar el formato original sin normalizar
+    if(prov && fo[prov] !== undefined) return fo[prov];
   }
-  return r?(r.estrato!==null&&r.estrato!==undefined?String(r.estrato):null):null;
+
+  let r = null;
+
+  // 2) Match exacto + 3) flexible — depende de cobertura
+  if(m.cobertura === 'provincial' || m.cobertura === 'municipal'){
+    // Solo importa el depto/nivel2 (la provincia es fija)
+    r = m.refTable.find(x => norm(x.nivel2) === dn);
+    if(!r && dn) r = m.refTable.find(x => {
+      const n2 = norm(x.nivel2);
+      return n2.includes(dn) || dn.includes(n2);
+    });
+  } else {
+    // Nacional o custom: prov + depto
+    r = m.refTable.find(x => normProv(x.nivel1) === pn && norm(x.nivel2) === dn);
+    if(!r && dn){
+      r = m.refTable.find(x => {
+        const n1 = normProv(x.nivel1);
+        const n2 = norm(x.nivel2);
+        return n1 === pn && (n2.includes(dn) || dn.includes(n2));
+      });
+    }
+    // 4) Si no hay match con depto pero la provincia tiene un único estrato, usar ese
+    if(!r && pn){
+      const provRows = m.refTable.filter(x => normProv(x.nivel1) === pn);
+      const uniqueEst = [...new Set(provRows.map(x => String(x.estrato)).filter(e => e !== 'null' && e !== 'undefined'))];
+      if(uniqueEst.length === 1){
+        return uniqueEst[0]; // toda la provincia mapea al mismo estrato
+      }
+    }
+  }
+
+  if(!r) return null;
+  return (r.estrato !== null && r.estrato !== undefined) ? String(r.estrato) : null;
 }
 
 // ══════════════════════════════════════════
@@ -1737,11 +1782,38 @@ function saveMuestra(){
   if(_editingMuestraId){ APP.muestras=APP.muestras.map(m=>m.id===_editingMuestraId?muestra:m); }
   else { APP.muestras.push(muestra); }
 
+  // Si estamos editando, re-procesar TODOS los casos de las activeSurveys que usan esta muestra
+  // Esto permite que cambios en el refTable (agregar GBA, corregir nombres, etc.) se reflejen
+  // automáticamente sin esperar al próximo sync.
+  let reprocessed = 0;
+  if(_editingMuestraId){
+    (APP.activeSurveys || []).forEach(sv => {
+      if(sv.muestraId !== _editingMuestraId) return;
+      // Usar _rawCases si existe, si no usar los cases actuales (con campos prov/depto preservados)
+      const source = (sv._rawCases && sv._rawCases.length) ? sv._rawCases :
+                     (sv.cases || []).map(c => ({ id: c.id, gen: c.gen, edad: c.edad, prov: c.prov, depto: c.depto }));
+      if(source.length){
+        sv.cases = processRawCases(source, muestra);
+        reprocessed += sv.cases.length;
+        // Si esta es la encuesta actualmente vista, refrescar APP.cases
+        if(APP.currentSurveyIdx != null && APP.activeSurveys[APP.currentSurveyIdx] === sv){
+          APP.cases = sv.cases;
+        }
+      }
+    });
+  }
+
   window._pendingRef=null;
   save();
   closeModal('muestra-modal');
   renderMuestras();
-  alert(`✓ Muestra "${nombre}" guardada.`);
+  if(APP.currentSurveyIdx != null) renderAll();
+  renderHome();
+  if(reprocessed > 0){
+    alert(`✓ Muestra "${nombre}" guardada. ${reprocessed} caso(s) reprocesados.`);
+  } else {
+    alert(`✓ Muestra "${nombre}" guardada.`);
+  }
 }
 
 function openActivateModal(id){
@@ -2169,11 +2241,30 @@ function renderDash(){
     });
     const fullSorted=sortAlerts(fullC).map(c=>({cls:'al-r',txt:`🔴 <strong>Completa:</strong> Est.${c.e} · ${c.g} · ${c.ag} — ${c.cur}/${c.tgt}`}));
     const warnSorted=sortAlerts(warnC).map(c=>({cls:'al-a',txt:`🟡 <strong>${Math.round(c.pf*100)}%</strong> · Est.${c.e} · ${c.g} · ${c.ag} — ${c.cur}/${c.tgt}`}));
+
+    // Casos sin estrato: alerta crítica
+    const sinEst = (APP.cases||[]).filter(c => c.estrato === '?').length;
+    let sinEstAlert = '';
+    if(sinEst > 0){
+      // Top 3 combinaciones prov+depto sin match para que vea qué corregir
+      const combos = new Map();
+      (APP.cases||[]).filter(c => c.estrato === '?').forEach(c => {
+        const k = `${c.prov || '(sin prov)'} / ${c.depto || '(sin depto)'}`;
+        combos.set(k, (combos.get(k) || 0) + 1);
+      });
+      const top = [...combos.entries()].sort((a,b)=>b[1]-a[1]).slice(0,3);
+      const detail = top.map(([k,n]) => `${n}× ${k}`).join(' · ');
+      sinEstAlert = `<div class="al al-a" style="background:rgba(240,166,46,0.12);border-left:3px solid var(--amber);font-size:12.5px">
+        ⚠️ <strong>${sinEst} casos sin estrato asignado</strong> — no se cuentan en la grilla. Revisá la muestra: la prov/depto del caso no matchea el refTable.
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;font-family:var(--mono)">${detail}</div>
+      </div>`;
+    }
+
     const all=[...fullSorted,...warnSorted];
-    if(!all.length&&tot>0) alertsEl.innerHTML=`<div class="al al-g">✓ Todo en orden</div>`;
-    else if(all.length){
+    if(!all.length&&tot>0&&!sinEst) alertsEl.innerHTML=`<div class="al al-g">✓ Todo en orden</div>`;
+    else if(all.length || sinEst){
       const SHOW=5, vis=all.slice(0,SHOW), hid=all.slice(SHOW);
-      alertsEl.innerHTML=vis.map(a=>`<div class="al ${a.cls}">${a.txt}</div>`).join('')+(hid.length?`<div id="alerts-more" style="display:none">${hid.map(a=>`<div class="al ${a.cls}">${a.txt}</div>`).join('')}</div><button class="alerts-more-btn" onclick="toggleAlertsMore(this)" data-n="${hid.length}">▾ Ver ${hid.length} más</button>`:'');
+      alertsEl.innerHTML = sinEstAlert + vis.map(a=>`<div class="al ${a.cls}">${a.txt}</div>`).join('')+(hid.length?`<div id="alerts-more" style="display:none">${hid.map(a=>`<div class="al ${a.cls}">${a.txt}</div>`).join('')}</div><button class="alerts-more-btn" onclick="toggleAlertsMore(this)" data-n="${hid.length}">▾ Ver ${hid.length} más</button>`:'');
     }
   }
 
@@ -2926,15 +3017,30 @@ function buildDeptoMapUI(questions) {
   if (!section || !container) return;
 
   const m = getActiveMuestra();
+  if (!m || !m.refTable || !m.refTable.length) { section.style.display = 'none'; return; }
+
+  // Soporta TODAS las coberturas:
+  // - nacional/custom: una entrada por nivel1 (provincia)
+  // - provincial/municipal: una sola entrada (porque hay un solo nivel1 = "país" o "provincia")
   let provs = [];
-  if (m && m.refTable && (m.cobertura === 'nacional' || m.cobertura === 'custom')) {
+  if (m.cobertura === 'nacional' || m.cobertura === 'custom') {
     provs = [...new Set(m.refTable.map(r => r.nivel1))].filter(Boolean).sort();
+  } else if (m.cobertura === 'provincial' || m.cobertura === 'municipal') {
+    // Una sola "provincia" virtual — usamos el primer nivel1 (suele ser el nombre del país/provincia)
+    const single = m.refTable[0]?.nivel1 || m.nombre || 'Único';
+    provs = [single];
   }
   if (!provs.length) { section.style.display = 'none'; return; }
   section.style.display = 'block';
+
+  // Helper: matching más flexible para sugerir la pregunta
+  // Busca por nombre de la provincia, "departamento", "localidad", "municipio", "ciudad", "distrito", etc.
+  const deptoKeywords = ['departamento','depto','localidad','ciudad','municipio','distrito','partido','comuna','barrio'];
   container.innerHTML = provs.map(prov => {
     const np = norm(prov).replace(/\s/g, '').substring(0, 6);
-    const guess = questions.findIndex(q => norm(q.heading).replace(/\s/g, '').includes(np));
+    let guess = questions.findIndex(q => norm(q.heading).replace(/\s/g, '').includes(np));
+    // Fallback: buscar por keywords genéricas
+    if (guess < 0) guess = questions.findIndex(q => deptoKeywords.some(k => norm(q.heading).includes(k)));
     return `<div class="field"><label>${prov}</label>
       <select id="smd-${prov.replace(/[^a-zA-Z0-9]/g,'_')}" data-prov="${prov}" style="width:100%">
         <option value="">(no tiene pregunta)</option>
@@ -3226,13 +3332,40 @@ function processRawCases(rawCases, muestra){
   const bounds = muestra.ageBounds || parseAgeBounds(groups);
   let nextId = 1;
 
-  return rawCases.map(raw => {
+  // Diagnóstico: contar casos sin asignar y mostrar las primeras 10 combinaciones únicas
+  const unmatched = new Map(); // "prov||depto" → count
+
+  const result = rawCases.map(raw => {
     const est = lookupEst(raw.prov, raw.depto, muestra);
     const estrato = (est !== null && est !== undefined) ? String(est) : '?';
     const ageGrp = getAgeGrp(parseInt(raw.edad), bounds, groups);
     const key = ck(raw.gen, ageGrp, estrato);
+
+    if(estrato === '?'){
+      const k = `${raw.prov || '(sin prov)'}||${raw.depto || '(sin depto)'}`;
+      unmatched.set(k, (unmatched.get(k) || 0) + 1);
+    }
+
     return { ...raw, estrato, ageGrp, key, id: raw.id || `R${String(nextId++).padStart(4,'0')}`, _raw: false };
   });
+
+  if(unmatched.size > 0){
+    const total = [...unmatched.values()].reduce((a,b)=>a+b,0);
+    const top = [...unmatched.entries()].sort((a,b)=>b[1]-a[1]).slice(0,10);
+    console.warn(`[pulso:processRawCases] ⚠ ${total}/${rawCases.length} casos SIN ESTRATO en muestra "${muestra.nombre}". Top combinaciones:`);
+    top.forEach(([k,n]) => {
+      const [prov, depto] = k.split('||');
+      console.warn(`   ${n}× prov="${prov}" depto="${depto}"`);
+    });
+    // Mostrar primeras 5 entradas del refTable para que el usuario compare
+    const sample = (muestra.refTable || []).slice(0, 5).map(r => `prov="${r.nivel1}" depto="${r.nivel2}" estrato=${r.estrato}`);
+    console.warn(`[pulso:processRawCases] muestra "${muestra.nombre}" cobertura=${muestra.cobertura}, refTable (primeras 5 filas):`);
+    sample.forEach(s => console.warn('   ' + s));
+  } else {
+    console.log(`[pulso:processRawCases] ✓ ${rawCases.length} casos asignados correctamente en muestra "${muestra.nombre}"`);
+  }
+
+  return result;
 }
 
 // Firebase listener: rawCases from server → update ONLY the matching survey
@@ -3782,6 +3915,123 @@ async function dashSyncStart(){
   }
 }
 
+// Diagnóstico: pide al server una muestra de casos crudos sin filtrar y los compara
+// contra el refTable de la muestra para mostrar cuáles no matchean y por qué.
+async function dashSyncDiagnostico(){
+  const url = getDashSyncUrl();
+  if(!url){ alert('Configurá el servidor primero (pestaña SurveyMonkey).'); return; }
+  const idx = APP.currentSurveyIdx;
+  const sv  = (idx != null) ? APP.activeSurveys?.[idx] : null;
+  if(!sv || !sv.smSurveyId){ alert('Esta encuesta no tiene un surveyId de SurveyMonkey vinculado.'); return; }
+  const muestra = (APP.muestras||[]).find(m => m.id === sv.muestraId);
+  if(!muestra){ alert('Esta encuesta no tiene una muestra asociada.'); return; }
+
+  // Modal placeholder
+  document.getElementById('diag-titulo').textContent = `Diagnóstico — ${sv.smTitle}`;
+  document.getElementById('diag-content').innerHTML = '<div style="padding:30px;text-align:center;color:var(--muted)">⟳ Pidiendo muestra al servidor...</div>';
+  openModal('diag-modal');
+
+  try {
+    const r = await fetch(`${url}/sync/preview/${encodeURIComponent(sv.smSurveyId)}`, { signal: AbortSignal.timeout(20000) });
+    const data = await r.json();
+    if(!r.ok || data.error){ throw new Error(data.error || 'HTTP '+r.status); }
+
+    const samples = data.samples || [];
+    if(!samples.length){ document.getElementById('diag-content').innerHTML = '<div style="padding:20px;color:var(--amber)">El servidor no devolvió casos. ¿Falta colMap?</div>'; return; }
+
+    // Para cada caso, calcular el estrato que asignaría lookupEst y por qué falla
+    const ref = muestra.refTable || [];
+    const refSummary = ref.slice(0, 10).map(r => `<tr><td style="padding:4px 8px;border-bottom:1px solid var(--border)">${r.nivel1||'—'}</td><td style="padding:4px 8px;border-bottom:1px solid var(--border)">${r.nivel2||'—'}</td><td style="padding:4px 8px;border-bottom:1px solid var(--border);color:var(--green)">${r.estrato}</td></tr>`).join('');
+
+    const provsRefSet = new Set(ref.map(r => normProv(r.nivel1)));
+    const deptosRefSet = new Set(ref.map(r => norm(r.nivel2)));
+
+    // Para los samples, agrupar por combinación
+    const byCombo = new Map(); // "prov||depto" → { count, sample, est }
+    for(const s of samples){
+      const k = `${s.prov||''}||${s.depto||''}`;
+      if(!byCombo.has(k)){
+        const est = lookupEst(s.prov, s.depto, muestra);
+        const provInRef = provsRefSet.has(normProv(s.prov));
+        const deptoInRef = deptosRefSet.has(norm(s.depto));
+        byCombo.set(k, { prov: s.prov, depto: s.depto, count: 0, est, provInRef, deptoInRef, deptoSource: s.deptoSource });
+      }
+      byCombo.get(k).count++;
+    }
+    const combos = [...byCombo.values()].sort((a,b)=>b.count-a.count);
+
+    const okCount = combos.filter(c=>c.est!==null && c.est!==undefined).reduce((a,c)=>a+c.count,0);
+    const failCount = samples.length - okCount;
+
+    const comboRows = combos.map(c=>{
+      const estTxt = (c.est!==null && c.est!==undefined) ? `<span style="color:var(--green);font-weight:700">✓ Estrato ${c.est}</span>` : `<span style="color:var(--red);font-weight:700">✗ NO MATCHEA</span>`;
+      const provBadge = c.provInRef ? '<span style="color:var(--green)">prov ✓</span>' : `<span style="color:var(--amber)">prov ✗</span>`;
+      const deptoBadge = c.deptoInRef ? '<span style="color:var(--green)">depto ✓</span>' : `<span style="color:var(--amber)">depto ✗</span>`;
+      return `<tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:6px 8px;font-family:var(--mono);font-size:11px">${c.count}</td>
+        <td style="padding:6px 8px">${c.prov || '<em style="color:var(--muted)">(vacío)</em>'}</td>
+        <td style="padding:6px 8px">${c.depto || '<em style="color:var(--muted)">(vacío)</em>'}</td>
+        <td style="padding:6px 8px;font-size:10.5px">${provBadge} · ${deptoBadge}</td>
+        <td style="padding:6px 8px">${estTxt}</td>
+      </tr>`;
+    }).join('');
+
+    const html = `
+      <div style="margin-bottom:18px;display:flex;gap:10px;flex-wrap:wrap">
+        <div style="background:var(--s2);border:1px solid var(--border);border-radius:6px;padding:10px 14px">
+          <div style="font-size:10.5px;color:var(--muted);text-transform:uppercase">Muestra de casos</div>
+          <div style="font-size:18px;font-weight:700;margin-top:2px">${samples.length}</div>
+        </div>
+        <div style="background:rgba(62,207,142,0.08);border:1px solid var(--green-b);border-radius:6px;padding:10px 14px">
+          <div style="font-size:10.5px;color:var(--muted);text-transform:uppercase">Asignan estrato</div>
+          <div style="font-size:18px;font-weight:700;margin-top:2px;color:var(--green)">${okCount}</div>
+        </div>
+        <div style="background:rgba(224,90,90,0.08);border:1px solid var(--red);border-radius:6px;padding:10px 14px">
+          <div style="font-size:10.5px;color:var(--muted);text-transform:uppercase">No matchean</div>
+          <div style="font-size:18px;font-weight:700;margin-top:2px;color:var(--red)">${failCount}</div>
+        </div>
+      </div>
+
+      <div style="margin-bottom:14px">
+        <div style="font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px">📥 Datos crudos que llegan de SurveyMonkey</div>
+        <div style="background:var(--s2);border:1px solid var(--border);border-radius:7px;overflow:auto;max-height:280px">
+          <table style="width:100%;border-collapse:collapse;font-size:12px">
+            <thead style="background:var(--s3);position:sticky;top:0">
+              <tr><th style="padding:8px;text-align:left">N°</th><th style="padding:8px;text-align:left">prov (de SM)</th><th style="padding:8px;text-align:left">depto (de SM)</th><th style="padding:8px;text-align:left">en refTable</th><th style="padding:8px;text-align:left">Resultado</th></tr>
+            </thead>
+            <tbody>${comboRows}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style="margin-bottom:14px">
+        <div style="font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px">📋 Tu refTable (primeras 10 filas) — cobertura: <span style="color:var(--green)">${muestra.cobertura}</span></div>
+        <div style="background:var(--s2);border:1px solid var(--border);border-radius:7px;overflow:auto;max-height:240px">
+          <table style="width:100%;border-collapse:collapse;font-size:12px">
+            <thead style="background:var(--s3);position:sticky;top:0">
+              <tr><th style="padding:8px;text-align:left">nivel1 (prov)</th><th style="padding:8px;text-align:left">nivel2 (depto)</th><th style="padding:8px;text-align:left">estrato</th></tr>
+            </thead>
+            <tbody>${refSummary}</tbody>
+          </table>
+        </div>
+        <div style="margin-top:6px;font-size:11px;color:var(--muted)">Total filas en refTable: ${ref.length}</div>
+      </div>
+
+      ${failCount > 0 ? `<div style="background:rgba(240,166,46,0.1);border-left:3px solid var(--amber);padding:12px 14px;border-radius:0 6px 6px 0;font-size:12.5px">
+        <strong>💡 Cómo arreglar el mapping:</strong>
+        <ul style="margin:6px 0 0 18px;padding:0;line-height:1.6">
+          <li>Si <strong>prov ✗</strong>: El nombre de provincia que devuelve SurveyMonkey no coincide con tu refTable. Editá la muestra y agregá ese nombre, o usá la columna "estratos fijos" para mapearlo directo a un estrato.</li>
+          <li>Si <strong>prov ✓ pero depto ✗</strong>: La provincia matchea pero el departamento no. Si el caso pertenece a una provincia con un único estrato, va a quedar bien igual (el sistema usa ese fallback). Si la provincia tiene varios estratos, agregá los deptos faltantes al refTable.</li>
+          <li>Si todos los casos vienen con <strong>depto vacío</strong>: el mapeo de la pregunta de depto está mal en la pestaña SurveyMonkey. Reconfigurá el sync.</li>
+        </ul>
+      </div>` : `<div style="background:rgba(62,207,142,0.1);border-left:3px solid var(--green);padding:12px 14px;border-radius:0 6px 6px 0;font-size:12.5px">✓ Todos los casos de la muestra asignan estrato correctamente.</div>`}
+    `;
+    document.getElementById('diag-content').innerHTML = html;
+  } catch(e) {
+    document.getElementById('diag-content').innerHTML = `<div style="padding:20px;color:var(--red)">Error: ${e.message}<br><br><span style="color:var(--muted);font-size:12px">Asegurate de que el server esté corriendo la versión nueva (con endpoint /sync/preview).</span></div>`;
+  }
+}
+
 async function dashSyncStop(){
   const url = getDashSyncUrl();
   if(!url){ return; }
@@ -3921,7 +4171,7 @@ function renderEstrato4(){
 // ══════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════
-const PULSO_VERSION = 'v4.7.4-light-snapshots-2026-04-28';
+const PULSO_VERSION = 'v4.7.6-strata-diagnostic-2026-04-28';
 load();
 console.log(`%c[pulso:init] ${PULSO_VERSION}`, 'background:#3ecf8e;color:#000;padding:3px 8px;font-weight:bold');
 console.log(`[pulso:init] localStorage cargado: ts=${APP.lastUpdated || 'NUNCA'} AS=${(APP.activeSurveys||[]).length} surv=${(APP.surveys||[]).length} muestras=${(APP.muestras||[]).length}`);
