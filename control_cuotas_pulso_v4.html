@@ -42,7 +42,7 @@
         if(!data){ console.log('[pulso:fb] sin data en v4config'); return; }
         if(window._suppressRemote){ console.log('[pulso:fb] _suppressRemote=true → ignoro fire'); return; }
         try {
-          const parsed = JSON.parse(data);
+          const parsed = typeof data === 'string' ? JSON.parse(data) : data;
           const localTs  = APP.lastUpdated   || 0;
           const remoteTs = parsed.lastUpdated || 0;
           const isFirst  = window._fbFirstFire;
@@ -98,7 +98,6 @@
       // onValue en la raíz recibe un objeto { surveyId1: "...", surveyId2: "..." }
       // Cada vez que cualquier sub-clave cambia, se dispara el listener
       onValue(fbSyncRef, (snap) => {
-        if(window._suppressRemote) return;
         const root = snap.val();
         if(!root) return;
         try {
@@ -3411,7 +3410,27 @@ function updateSurveyFromFirebase(data){
     if(data.rawCases){
       sv._rawCases = data.rawCases; // store originals per-survey
       const muestra = (APP.muestras||[]).find(m => m.id === sv.muestraId);
-      sv.cases = processRawCases(data.rawCases, muestra);
+      if(muestra){
+        sv.cases = processRawCases(data.rawCases, muestra);
+      } else {
+        // Muestra aún no disponible (race condition: sync llegó antes que config).
+        // Guardamos rawCases y reintentamos en 800ms, cuando config ya habrá poblado APP.muestras.
+        console.warn(`[pulso:sync] muestra "${sv.muestraId}" no encontrada — reintentando en 800ms`);
+        setTimeout(() => {
+          const m2 = (APP.muestras||[]).find(m => m.id === sv.muestraId);
+          if(m2 && sv._rawCases){
+            sv.cases = processRawCases(sv._rawCases, m2);
+            const idx = (APP.activeSurveys||[]).indexOf(sv);
+            if(APP.currentSurveyIdx != null && APP.currentSurveyIdx === idx){
+              APP.cases  = sv.cases || [];
+              APP.quotas = sv.quotas || {};
+              renderAll();
+              updateDashSyncBar();
+            }
+            renderHome();
+          }
+        }, 800);
+      }
     } else if(data.cases){
       sv.cases = data.cases;
     }
@@ -3421,12 +3440,6 @@ function updateSurveyFromFirebase(data){
       updatedCurrent = true;
     }
   });
-
-  // Persistir timestamps en Firebase para que todos los dispositivos los vean
-  // Usamos un path separado para no interferir con v4sync ni activar _suppressRemote
-  if(window._fbSet && window._fbSyncRef) {
-    // No hacemos nada extra: v4sync ya tiene lastSync y todos lo leen via onValue
-  }
 
   // Refresh currently viewed survey only if it was updated
   if(updatedCurrent && APP.currentSurveyIdx != null){
